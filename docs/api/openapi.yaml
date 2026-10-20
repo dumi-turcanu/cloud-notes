@@ -1,0 +1,785 @@
+openapi: 3.1.0
+info:
+  title: Cloud Notes API
+  version: 1.0.0
+  summary: JSON API of the Cloud Notes application.
+  description: |
+    All application routes live under the base path `/api` (backend setting `API_BASE_PATH`) on the
+    **same origin** as the web UI. Responses are JSON with snake_case field names and RFC 3339 UTC
+    timestamps. Every non-2xx response from `/api` uses the [`Error`](#/components/schemas/Error) shape.
+
+    Authentication is a server-side session: `POST /api/auth/login` (or `register`) sets an
+    `HttpOnly`, `SameSite=Strict` cookie. It is named `__Host-cn_session` when the backend runs with
+    `SESSION_COOKIE_SECURE=true` (the default; requires HTTPS) and `cn_session` otherwise.
+
+    State-changing requests are protected against CSRF (`403 forbidden` for cross-site browser
+    requests). Request bodies are limited to 256 KiB and unknown JSON fields are rejected.
+
+    The operational endpoints `/healthz` and `/readyz` are served at the root of the backend, and
+    Prometheus metrics on a separate listener (`GET /metrics`, port 9090); they are described under the
+    `operations` tag.
+servers:
+  - url: /
+    description: Same origin as the web UI (nginx proxies `/api/*` to the backend).
+tags:
+  - name: config
+    description: Public configuration used by the web UI.
+  - name: auth
+    description: Registration, sign-in and sign-out.
+  - name: notes
+    description: Notes of the signed-in user.
+  - name: sharing
+    description: Public share links. Only available when the backend runs with `FEATURE_PUBLIC_SHARING=true`; otherwise these routes do not exist and answer `404`.
+  - name: operations
+    description: Health checks and metrics (not under `/api`).
+paths:
+  /healthz:
+    get:
+      tags: [operations]
+      operationId: getLiveness
+      summary: Liveness probe
+      description: Answers `200` as long as the process runs. Does not check any dependency.
+      security: []
+      responses:
+        "200":
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /readyz:
+    get:
+      tags: [operations]
+      operationId: getReadiness
+      summary: Readiness probe
+      description: |
+        `200` when the database answers a ping within 2 seconds. `503` when it does not, and
+        immediately once graceful shutdown has started.
+      security: []
+      responses:
+        "200":
+          description: Ready to receive traffic.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ready
+        "503":
+          description: Not ready (database unavailable or shutting down).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [unavailable, shutting_down]
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /metrics:
+    get:
+      tags: [operations]
+      operationId: getMetrics
+      summary: Prometheus metrics
+      description: Served on the separate metrics listener (`METRICS_ADDR`, default `:9090`), never on the main listener. Do not expose it through the edge.
+      security: []
+      servers:
+        - url: http://backend:9090
+          description: Metrics listener of the backend (internal network only).
+      responses:
+        "200":
+          description: Metrics in the Prometheus text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /api/config:
+    get:
+      tags: [config]
+      operationId: getConfig
+      summary: Public application configuration
+      security: []
+      responses:
+        "200":
+          description: Configuration relevant to the UI.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppConfig"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /api/auth/register:
+    post:
+      tags: [auth]
+      operationId: register
+      summary: Create an account and sign in
+      description: |
+        Only available when the sign-up mode is `open`, or `invite` with a valid `invite_code`.
+        Subject to the per-IP rate limit. On success a session cookie is set.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Account created and signed in.
+          headers:
+            Set-Cookie:
+              $ref: "#/components/headers/SetSessionCookie"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          description: Malformed body (`invalid_request`) or invalid fields (`validation_failed`, with `fields`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Sign-up is closed (`signup_disabled`), the invite code is wrong (`invalid_invite_code`), or the request was rejected by CSRF protection (`forbidden`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: The e-mail address is already registered (`email_taken`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Sign in
+      description: |
+        Verifies the credentials and starts a new session. A session cookie presented on the request is
+        revoked first. After `AUTH_MAX_FAILED_LOGINS` consecutive failures the account is locked for
+        `AUTH_LOCKOUT_DURATION` (`429 too_many_attempts`). Unknown e-mails and wrong passwords both
+        answer `401 invalid_credentials`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Signed in.
+          headers:
+            Set-Cookie:
+              $ref: "#/components/headers/SetSessionCookie"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Wrong e-mail or password (`invalid_credentials`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          description: Account locked (`too_many_attempts`) or per-IP rate limit exceeded (`too_many_requests`). Both carry `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/RetryAfter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: Sign out
+      description: Deletes the session if one is presented and clears the cookie. Always answers `204`.
+      security: []
+      responses:
+        "204":
+          description: Signed out (also when there was no session).
+          headers:
+            Set-Cookie:
+              description: Expires the session cookie.
+              schema:
+                type: string
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/auth/me:
+    get:
+      tags: [auth]
+      operationId: getCurrentUser
+      summary: Current user
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The signed-in user.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/notes:
+    get:
+      tags: [notes]
+      operationId: listNotes
+      summary: List active notes
+      description: Notes that are not in the trash, newest first. With `since`, only notes whose `updated_at` is later.
+      security:
+        - sessionCookie: []
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: Return only notes updated after this instant.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: A JSON array (empty when there are no notes).
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Note"
+        "400":
+          description: "`since` is not a valid RFC 3339 timestamp (`invalid_request`)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    post:
+      tags: [notes]
+      operationId: createNote
+      summary: Create a note
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NoteRequest"
+      responses:
+        "201":
+          description: The created note.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Note"
+        "400":
+          $ref: "#/components/responses/BadRequestOrValidation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/notes/trash:
+    get:
+      tags: [notes]
+      operationId: listTrash
+      summary: List notes in the trash
+      description: Soft-deleted notes, most recently deleted first.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: A JSON array (empty when the trash is empty).
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Note"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/notes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/NoteId"
+    get:
+      tags: [notes]
+      operationId: getNote
+      summary: Get a note
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The note.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Note"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    put:
+      tags: [notes]
+      operationId: updateNote
+      summary: Replace title and content of a note
+      description: Updates `updated_at`. Answers `404` for notes of other users.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NoteRequest"
+      responses:
+        "200":
+          description: The updated note.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Note"
+        "400":
+          $ref: "#/components/responses/BadRequestOrValidation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      tags: [notes]
+      operationId: deleteNote
+      summary: Move a note to the trash
+      description: Soft delete; the note can be restored.
+      security:
+        - sessionCookie: []
+      responses:
+        "204":
+          description: The note is in the trash.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/notes/{id}/restore:
+    parameters:
+      - $ref: "#/components/parameters/NoteId"
+    post:
+      tags: [notes]
+      operationId: restoreNote
+      summary: Restore a note from the trash
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The restored note.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Note"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: The note does not exist, is not yours, or is not in the trash (`not_found`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/notes/{id}/publish:
+    parameters:
+      - $ref: "#/components/parameters/NoteId"
+    post:
+      tags: [sharing]
+      operationId: publishNote
+      summary: Publish a note
+      description: Makes the note readable by anyone who knows its share link. Only registered when `FEATURE_PUBLIC_SHARING=true`.
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The note including its share link.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublishedNote"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      tags: [sharing]
+      operationId: unpublishNote
+      summary: Stop sharing a note
+      description: Only registered when `FEATURE_PUBLIC_SHARING=true`.
+      security:
+        - sessionCookie: []
+      responses:
+        "204":
+          description: The note is no longer public.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/public/notes/{share_uuid}:
+    get:
+      tags: [sharing]
+      operationId: getPublicNote
+      summary: Read a published note
+      description: Unauthenticated. Only registered when `FEATURE_PUBLIC_SHARING=true`. Exposes no ids and no user data.
+      security: []
+      parameters:
+        - name: share_uuid
+          in: path
+          required: true
+          description: The `share_uuid` of a published note.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The published note.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicNote"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-cn_session
+      description: |
+        Session cookie set by `login` and `register`. The name is `__Host-cn_session` with
+        `SESSION_COOKIE_SECURE=true` (default) and `cn_session` for plain-HTTP development. It is
+        `HttpOnly`, `SameSite=Strict`, `Path=/`; browsers send it automatically.
+  parameters:
+    NoteId:
+      name: id
+      in: path
+      required: true
+      description: Note id.
+      schema:
+        type: string
+        format: uuid
+  headers:
+    SetSessionCookie:
+      description: The session cookie (`HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=<remaining lifetime>`).
+      schema:
+        type: string
+    NoStore:
+      description: Always `no-store`.
+      schema:
+        type: string
+        const: no-store
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        minimum: 1
+  responses:
+    BadRequest:
+      description: Malformed or unknown fields (`invalid_request`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequestOrValidation:
+      description: Malformed body or unknown fields (`invalid_request`), or invalid values (`validation_failed`, with `fields`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: No valid session (`unauthorized`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Rejected by CSRF protection (`forbidden`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: The resource does not exist or belongs to someone else (`not_found`). Unknown routes answer the same.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    MethodNotAllowed:
+      description: Other HTTP methods are not supported on this route (`method_not_allowed`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: The request body exceeds 256 KiB (`payload_too_large`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: Per-IP rate limit exceeded (`too_many_requests`).
+      headers:
+        Retry-After:
+          $ref: "#/components/headers/RetryAfter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: Unexpected server error (`internal_error`). Details are in the server log, correlated by `X-Request-ID`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable code.
+          enum:
+            - invalid_request
+            - validation_failed
+            - unauthorized
+            - forbidden
+            - signup_disabled
+            - invalid_invite_code
+            - invalid_credentials
+            - email_taken
+            - not_found
+            - method_not_allowed
+            - too_many_requests
+            - too_many_attempts
+            - payload_too_large
+            - internal_error
+        message:
+          type: string
+          description: Human-readable explanation.
+        fields:
+          type: object
+          description: Per-field validation messages (only with `validation_failed`).
+          additionalProperties:
+            type: string
+      examples:
+        - error: validation_failed
+          message: request validation failed
+          fields:
+            password: must be 12-128 characters
+    AppConfig:
+      type: object
+      required: [signup_mode, features, version]
+      properties:
+        signup_mode:
+          type: string
+          enum: [disabled, invite, open]
+        features:
+          type: object
+          required: [public_sharing]
+          properties:
+            public_sharing:
+              type: boolean
+        version:
+          type: string
+          description: Backend version.
+    User:
+      type: object
+      required: [id, email, display_name, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        display_name:
+          type: [string, "null"]
+          maxLength: 100
+        created_at:
+          type: string
+          format: date-time
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          format: password
+          minLength: 12
+          maxLength: 128
+          description: Must not equal the e-mail address.
+        display_name:
+          type: string
+          maxLength: 100
+        invite_code:
+          type: string
+          description: Required when the sign-up mode is `invite`.
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+    NoteContent:
+      type: object
+      description: Free-form JSON object. The web UI stores the note text in `body`.
+      properties:
+        body:
+          type: string
+      additionalProperties: true
+    NoteRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Length is counted in characters (runes).
+        content:
+          $ref: "#/components/schemas/NoteContent"
+    Note:
+      type: object
+      required: [id, user_id, title, content, is_public, share_uuid, created_at, updated_at, deleted_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        content:
+          $ref: "#/components/schemas/NoteContent"
+        is_public:
+          type: boolean
+        share_uuid:
+          type: string
+          format: uuid
+          description: Identifier used in the public link once the note is published.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        deleted_at:
+          type: [string, "null"]
+          format: date-time
+          description: Set while the note is in the trash.
+    PublishedNote:
+      allOf:
+        - $ref: "#/components/schemas/Note"
+        - type: object
+          required: [share_url]
+          properties:
+            share_url:
+              type: string
+              format: uri
+              description: "`PUBLIC_APP_URL` + `/shared/` + `share_uuid`."
+    PublicNote:
+      type: object
+      required: [title, content, updated_at]
+      properties:
+        title:
+          type: string
+        content:
+          $ref: "#/components/schemas/NoteContent"
+        updated_at:
+          type: string
+          format: date-time

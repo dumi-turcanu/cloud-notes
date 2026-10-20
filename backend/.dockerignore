@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+bin/
+coverage*
+*.md
+.git
+.gitignore
+Dockerfile
+.dockerignore

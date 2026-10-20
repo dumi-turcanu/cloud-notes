@@ -1,0 +1,97 @@
+# Local, production-like stack: PostgreSQL + backend + nginx frontend.
+#   http://localhost:3000  nginx (SPA + /api proxy) — use this one
+#   http://localhost:8080  backend API directly (debugging)
+# For hot reload run `npm run dev` in frontend/ (http://localhost:5173, proxies to :8080).
+#
+# The credentials below are THROW-AWAY, LOCAL-DEVELOPMENT-ONLY values.
+# Never reuse them anywhere that is reachable from a network.
+
+name: cloud-notes
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: cloudnotes
+      POSTGRES_PASSWORD: cloudnotes-local-only # local development only
+      POSTGRES_DB: cloudnotes
+    volumes:
+      # PostgreSQL 18 images keep data in a versioned directory below /var/lib/postgresql.
+      - db-data:/var/lib/postgresql
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloudnotes -d cloudnotes"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  backend:
+    image: cloud-notes-backend:dev
+    build:
+      context: ./backend
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: cloudnotes
+      DB_USER: cloudnotes
+      DB_PASSWORD: cloudnotes-local-only # local development only
+      DB_SSLMODE: disable # plain-text link inside the compose network only
+      AUTH_SIGNUP_MODE: open # local convenience; production default is "disabled"
+      SESSION_COOKIE_SECURE: "false" # the local stack is served over plain HTTP
+      FEATURE_PUBLIC_SHARING: "true"
+      PUBLIC_APP_URL: http://localhost:3000
+      TRUSTED_PROXY_HOPS: "1" # nginx is the only proxy in front of the API
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/cloud-notes-api", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  frontend:
+    image: cloud-notes-frontend:dev
+    build:
+      context: ./frontend
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+    environment:
+      API_UPSTREAM: http://backend:8080
+    ports:
+      - "127.0.0.1:3000:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+      # Rendered nginx configuration (written at container start by the entrypoint).
+      - /etc/nginx/conf.d:uid=101,gid=101,mode=0755
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+volumes:
+  db-data:
