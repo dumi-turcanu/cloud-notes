@@ -34,6 +34,8 @@ var (
 	ErrInvalidInviteCode  = errors.New("invalid invite code")
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrUnauthenticated    = errors.New("not authenticated")
+	// ErrEmailClaimMissing means the identity provider sent no usable email.
+	ErrEmailClaimMissing = errors.New("identity has no valid email")
 )
 
 // LockedError is returned while an account is locked after too many failures.
@@ -53,6 +55,10 @@ type UserStore interface {
 	RecordLoginFailure(ctx context.Context, id uuid.UUID, maxFailures int, lockout time.Duration) (*time.Time, error)
 	RecordLoginSuccess(ctx context.Context, id uuid.UUID) error
 	UpdatePasswordHash(ctx context.Context, id uuid.UUID, hash string) error
+	// UpsertExternal finds or creates the user for an external identity,
+	// keyed on (issuer, subject). It returns models.ErrAccountConflict when
+	// the email belongs to another account.
+	UpsertExternal(ctx context.Context, id models.ExternalIdentity) (*models.User, error)
 }
 
 // SessionStore is the session persistence the service needs.
@@ -85,6 +91,9 @@ func OptionsFromConfig(c config.Config) Options {
 		LockoutDuration: c.LockoutDuration,
 	}
 }
+
+// ExternalIdentity is a verified identity from an OIDC or Identity Platform token.
+type ExternalIdentity = models.ExternalIdentity
 
 // ClientMeta is request metadata recorded with a session.
 type ClientMeta struct{ UserAgent, IP string }
@@ -199,7 +208,9 @@ func (s *Service) Login(ctx context.Context, rawEmail, password string, meta Cli
 			return nil, fmt.Errorf("load user: %w", err)
 		}
 	}
-	if acct == nil {
+	// Users that sign in through an external provider have no password hash:
+	// they get the same answer and the same work as unknown users.
+	if acct == nil || acct.PasswordHash == "" {
 		_, _ = s.hasher.Verify(ctx, password, s.dummyHash) // equalise timing
 		return nil, ErrInvalidCredentials
 	}
@@ -231,6 +242,27 @@ func (s *Service) Login(ctx context.Context, rawEmail, password string, meta Cli
 		s.rehash(ctx, acct.ID, password)
 	}
 	return s.issue(ctx, acct.ID, acct.User, meta)
+}
+
+// LoginExternal issues a session for an identity already verified by the
+// provider adapter (OIDC callback or Identity Platform token). The user is
+// found by (issuer, subject) and created on first login; there is no linking
+// by email.
+func (s *Service) LoginExternal(ctx context.Context, id ExternalIdentity, meta ClientMeta) (*Issued, error) {
+	email, ok := NormalizeEmail(id.Email)
+	if !ok {
+		return nil, ErrEmailClaimMissing
+	}
+	id.Email = email
+	id.DisplayName = strings.TrimSpace(id.DisplayName)
+	if utf8.RuneCountInString(id.DisplayName) > maxDisplayNameLen {
+		id.DisplayName = string([]rune(id.DisplayName)[:maxDisplayNameLen])
+	}
+	user, err := s.users.UpsertExternal(ctx, id)
+	if err != nil {
+		return nil, err // models.ErrAccountConflict passes through
+	}
+	return s.issue(ctx, user.ID, *user, meta)
 }
 
 // rehash upgrades the stored hash to current parameters; failures are logged only.

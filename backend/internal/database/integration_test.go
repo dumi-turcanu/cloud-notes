@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,6 +70,8 @@ func TestMigrationsAreIdempotentAndSchemaMatchesContract(t *testing.T) {
 		"users":    {"id", "email", "display_name", "password_hash", "failed_login_count", "locked_until", "last_login_at", "created_at", "updated_at"},
 		"sessions": {"token_hash", "user_id", "created_at", "last_seen_at", "expires_at", "user_agent", "client_ip"},
 		"notes":    {"id", "user_id", "title", "content", "is_public", "share_uuid", "created_at", "updated_at", "deleted_at"},
+
+		"user_identities": {"issuer", "subject", "user_id", "created_at", "last_login_at"},
 	}
 	for table, want := range cols {
 		rows, err := testPool.Query(ctx, `SELECT column_name FROM information_schema.columns
@@ -402,5 +406,230 @@ func TestNotesCascadeWithUser(t *testing.T) {
 func TestPoolHonoursMaxConns(t *testing.T) {
 	if got := testPool.Config().MaxConns; got != 5 {
 		t.Errorf("MaxConns = %d, want 5", got)
+	}
+}
+
+func extID(email string) models.ExternalIdentity {
+	return models.ExternalIdentity{Issuer: "https://idp.example.com/" + uuid.NewString(), Subject: uuid.NewString(), Email: email}
+}
+
+func TestUpsertExternalCreatesUserWithoutPassword(t *testing.T) {
+	ctx := context.Background()
+	repo := database.NewUserRepository(testPool)
+	id := extID(fmt.Sprintf("%s@example.com", uuid.NewString()))
+	id.DisplayName = "Eve"
+
+	u, err := repo.UpsertExternal(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.ID == uuid.Nil || u.Email != id.Email || u.DisplayName == nil || *u.DisplayName != "Eve" || u.CreatedAt.IsZero() {
+		t.Fatalf("created: %+v", u)
+	}
+	// scanUser must cope with the NULL password_hash.
+	acct, err := repo.GetByEmail(ctx, id.Email)
+	if err != nil || acct.ID != u.ID || acct.PasswordHash != "" || acct.LastLoginAt == nil {
+		t.Errorf("by email: %+v %v", acct, err)
+	}
+	if acct, err := repo.GetByID(ctx, u.ID); err != nil || acct.PasswordHash != "" {
+		t.Errorf("by id: %+v %v", acct, err)
+	}
+	var nulls int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM users WHERE id = $1 AND password_hash IS NULL`, u.ID).Scan(&nulls); err != nil || nulls != 1 {
+		t.Errorf("password_hash must be NULL (count=%d err=%v)", nulls, err)
+	}
+
+	// No display name claim: the column stays NULL.
+	bare, err := repo.UpsertExternal(ctx, extID(fmt.Sprintf("%s@example.com", uuid.NewString())))
+	if err != nil || bare.DisplayName != nil {
+		t.Errorf("bare identity: %+v %v", bare, err)
+	}
+}
+
+func TestUpsertExternalIsIdempotentAndRefreshesProfile(t *testing.T) {
+	ctx := context.Background()
+	repo := database.NewUserRepository(testPool)
+	id := extID(fmt.Sprintf("%s@example.com", uuid.NewString()))
+	id.DisplayName = "Old"
+	first, err := repo.UpsertExternal(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id.Email, id.DisplayName = fmt.Sprintf("%s@example.com", uuid.NewString()), "New"
+	second, err := repo.UpsertExternal(ctx, id)
+	if err != nil || second.ID != first.ID || second.Email != id.Email || *second.DisplayName != "New" {
+		t.Fatalf("refresh: %+v %v", second, err)
+	}
+
+	// An empty display name claim does not erase the stored one.
+	id.DisplayName = ""
+	third, err := repo.UpsertExternal(ctx, id)
+	if err != nil || third.ID != first.ID || third.DisplayName == nil || *third.DisplayName != "New" {
+		t.Errorf("empty name: %+v %v", third, err)
+	}
+
+	var users, identities int
+	_ = testPool.QueryRow(ctx, `SELECT count(*) FROM user_identities WHERE issuer = $1`, id.Issuer).Scan(&identities)
+	_ = testPool.QueryRow(ctx, `SELECT count(*) FROM users WHERE email = $1`, id.Email).Scan(&users)
+	if users != 1 || identities != 1 {
+		t.Errorf("users=%d identities=%d, want 1 each", users, identities)
+	}
+	var lastLogin *time.Time
+	_ = testPool.QueryRow(ctx, `SELECT last_login_at FROM user_identities WHERE issuer = $1 AND subject = $2`, id.Issuer, id.Subject).Scan(&lastLogin)
+	if lastLogin == nil {
+		t.Error("identity last_login_at not stamped")
+	}
+}
+
+func TestUpsertExternalKeepsEmailTakenByAnotherAccount(t *testing.T) {
+	ctx := context.Background()
+	repo := database.NewUserRepository(testPool)
+	id := extID(fmt.Sprintf("%s@example.com", uuid.NewString()))
+	id.DisplayName = "Old"
+	first, err := repo.UpsertExternal(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := newUser(t)
+
+	id.Email, id.DisplayName = other.Email, "New"
+	got, err := repo.UpsertExternal(ctx, id)
+	if err != nil {
+		t.Fatalf("a taken email on refresh must not fail the login: %v", err)
+	}
+	if got.ID != first.ID || got.Email != first.Email || *got.DisplayName != "New" {
+		t.Errorf("want old email kept and name refreshed: %+v", got)
+	}
+	if o, _ := repo.GetByID(ctx, other.ID); o.Email != other.Email {
+		t.Error("the other account must be untouched")
+	}
+}
+
+func TestUpsertExternalNeverLinksByEmail(t *testing.T) {
+	ctx := context.Background()
+	repo := database.NewUserRepository(testPool)
+	local := newUser(t)
+
+	_, err := repo.UpsertExternal(ctx, extID(local.Email))
+	if !errors.Is(err, models.ErrAccountConflict) {
+		t.Fatalf("got %v, want ErrAccountConflict", err)
+	}
+	var identities int
+	_ = testPool.QueryRow(ctx, `SELECT count(*) FROM user_identities WHERE user_id = $1`, local.ID).Scan(&identities)
+	if identities != 0 {
+		t.Error("a conflicting identity must not be attached to the local account")
+	}
+	if got, _ := repo.GetByID(ctx, local.ID); got.PasswordHash != local.PasswordHash {
+		t.Error("local account modified")
+	}
+	// The failed attempt left nothing behind: the same identity conflicts again.
+	if _, err := repo.UpsertExternal(ctx, extID(local.Email)); !errors.Is(err, models.ErrAccountConflict) {
+		t.Errorf("second attempt: %v", err)
+	}
+
+	// Same email at two different issuers: two identities, one account would
+	// be a takeover vector, so the second one conflicts.
+	email := fmt.Sprintf("%s@example.com", uuid.NewString())
+	if _, err := repo.UpsertExternal(ctx, extID(email)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpsertExternal(ctx, extID(email)); !errors.Is(err, models.ErrAccountConflict) {
+		t.Errorf("same email, other issuer: %v", err)
+	}
+}
+
+func TestUpsertExternalConcurrentFirstLogins(t *testing.T) {
+	ctx := context.Background()
+	repo := database.NewUserRepository(testPool)
+	id := extID(fmt.Sprintf("%s@example.com", uuid.NewString()))
+
+	const n = 8
+	ids := make([]uuid.UUID, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			u, err := repo.UpsertExternal(ctx, id)
+			errs[i] = err
+			if u != nil {
+				ids[i] = u.ID
+			}
+		}()
+	}
+	wg.Wait()
+	for i := range n {
+		if errs[i] != nil || ids[i] != ids[0] {
+			t.Errorf("login %d: id %v err %v (want the same user for all)", i, ids[i], errs[i])
+		}
+	}
+	var users int
+	_ = testPool.QueryRow(ctx, `SELECT count(*) FROM users WHERE email = $1`, id.Email).Scan(&users)
+	if users != 1 {
+		t.Errorf("users = %d, want 1", users)
+	}
+}
+
+func TestIdentitiesCascadeWithUser(t *testing.T) {
+	ctx := context.Background()
+	repo := database.NewUserRepository(testPool)
+	id := extID(fmt.Sprintf("%s@example.com", uuid.NewString()))
+	u, err := repo.UpsertExternal(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM users WHERE id = $1`, u.ID); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	_ = testPool.QueryRow(ctx, `SELECT count(*) FROM user_identities WHERE issuer = $1`, id.Issuer).Scan(&n)
+	if n != 0 {
+		t.Error("identities must cascade-delete with the user")
+	}
+}
+
+// The down migration restores NOT NULL only when no passwordless user exists.
+// Both runs happen in a transaction that is rolled back.
+func TestMigration000002Down(t *testing.T) {
+	ctx := context.Background()
+	down, err := os.ReadFile("migrations/000002_external_identities.down.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := database.NewUserRepository(testPool)
+	if _, err := repo.UpsertExternal(ctx, extID(fmt.Sprintf("%s@example.com", uuid.NewString()))); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, string(down))
+	_ = tx.Rollback(ctx)
+	if err == nil || !strings.Contains(err.Error(), "cannot roll back 000002") {
+		t.Errorf("down must refuse while passwordless users exist, got %v", err)
+	}
+
+	tx, err = testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `DELETE FROM users WHERE password_hash IS NULL`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, string(down)); err != nil {
+		t.Fatalf("down must succeed without passwordless users: %v", err)
+	}
+	var tables int
+	_ = tx.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables WHERE table_name = 'user_identities'`).Scan(&tables)
+	if tables != 0 {
+		t.Error("user_identities must be dropped")
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO users (email, password_hash) VALUES ('x@example.com', NULL)`); err == nil {
+		t.Error("password_hash must be NOT NULL again")
 	}
 }

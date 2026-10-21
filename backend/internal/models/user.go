@@ -33,10 +33,16 @@ type LoginRequest struct {
 // credentials and lockout state. It must never be serialised to clients.
 type UserAccount struct {
 	User
-	PasswordHash     string
+	PasswordHash     string // empty for users that sign in through an external provider
 	FailedLoginCount int
 	LockedUntil      *time.Time
 	LastLoginAt      *time.Time
+}
+
+// ExternalIdentity is a verified identity from an external provider: the
+// issuer and subject identify the person, the rest comes from the claims.
+type ExternalIdentity struct {
+	Issuer, Subject, Email, DisplayName string
 }
 
 // Session is a server-side login session. TokenHash is SHA-256 of the cookie

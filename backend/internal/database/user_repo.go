@@ -27,13 +27,17 @@ const userColumns = `id, email, display_name, password_hash, failed_login_count,
 
 func scanUser(row pgx.Row) (*models.UserAccount, error) {
 	u := &models.UserAccount{}
-	err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.PasswordHash, &u.FailedLoginCount,
+	var hash *string // NULL for users that sign in through an external provider
+	err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &hash, &u.FailedLoginCount,
 		&u.LockedUntil, &u.LastLoginAt, &u.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, models.ErrNotFound
 	}
 	if err != nil {
 		return nil, err
+	}
+	if hash != nil {
+		u.PasswordHash = *hash
 	}
 	return u, nil
 }

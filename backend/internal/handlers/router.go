@@ -122,8 +122,12 @@ func newAPIHandler(d Deps) (http.Handler, error) {
 
 	api.Route("/auth", func(r chi.Router) {
 		r.Use(httpx.NoStore)
-		r.Post("/register", authH.Register)
-		r.Post("/login", authH.Login)
+		// With an external provider the identity service owns credentials, so
+		// the password endpoints are not mounted and fall through to 404.
+		if !externalAuth(cfg) {
+			r.Post("/register", authH.Register)
+			r.Post("/login", authH.Login)
+		}
 		r.Post("/logout", authH.Logout)
 		r.With(require).Get("/me", authH.Me)
 	})
@@ -160,16 +164,51 @@ func routeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteError(w, http.StatusMethodNotAllowed, httpx.CodeMethodNotAllowed, "method not allowed")
 }
 
+// externalAuth reports whether credentials are handled by an external identity
+// provider. An unset provider (tests building a Config by hand) means local.
+func externalAuth(cfg config.Config) bool {
+	return cfg.AuthProvider == config.AuthOIDC || cfg.AuthProvider == config.AuthIdentityPlatform
+}
+
 func publicConfig(cfg config.Config, version string) http.HandlerFunc {
 	type features struct {
 		PublicSharing bool `json:"public_sharing"`
 	}
+	// identityPlatform is the Firebase web configuration; the API key is
+	// public by design.
+	type identityPlatform struct {
+		APIKey        string   `json:"api_key"`
+		AuthDomain    string   `json:"auth_domain"`
+		ProjectID     string   `json:"project_id"`
+		TenantID      string   `json:"tenant_id,omitempty"`
+		SignInMethods []string `json:"sign_in_methods"`
+	}
+	type authInfo struct {
+		Provider         string            `json:"provider"`
+		DisplayName      string            `json:"display_name,omitempty"`
+		IdentityPlatform *identityPlatform `json:"identity_platform,omitempty"`
+	}
 	type body struct {
 		SignupMode string   `json:"signup_mode"`
 		Features   features `json:"features"`
+		Auth       authInfo `json:"auth"`
 		Version    string   `json:"version"`
 	}
-	resp := body{SignupMode: cfg.SignupMode, Features: features{PublicSharing: cfg.PublicSharing}, Version: version}
+	resp := body{
+		SignupMode: cfg.SignupMode,
+		Features:   features{PublicSharing: cfg.PublicSharing},
+		Auth:       authInfo{Provider: config.AuthLocal},
+		Version:    version,
+	}
+	switch cfg.AuthProvider {
+	case config.AuthOIDC:
+		resp.Auth = authInfo{Provider: config.AuthOIDC, DisplayName: cfg.OIDCProviderName}
+	case config.AuthIdentityPlatform:
+		resp.Auth = authInfo{Provider: config.AuthIdentityPlatform, IdentityPlatform: &identityPlatform{
+			APIKey: cfg.IDPAPIKey, AuthDomain: cfg.IDPAuthDomain, ProjectID: cfg.IDPProjectID,
+			TenantID: cfg.IDPTenantID, SignInMethods: cfg.IDPSignInMethods,
+		}}
+	}
 	return func(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, resp)
 	}

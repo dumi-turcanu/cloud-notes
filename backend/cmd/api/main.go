@@ -189,7 +189,7 @@ func serve(ctx context.Context) error {
 	}
 
 	logger.Info("starting", "version", version, "commit", commit, "http_addr", cfg.HTTPAddr,
-		"metrics_addr", cfg.MetricsAddr, "signup_mode", cfg.SignupMode, "public_sharing", cfg.PublicSharing)
+		"metrics_addr", cfg.MetricsAddr, "auth_provider", cfg.AuthProvider, "signup_mode", cfg.SignupMode, "public_sharing", cfg.PublicSharing)
 	return server.Run(ctx, server.Options{
 		Addr:            cfg.HTTPAddr,
 		MetricsAddr:     cfg.MetricsAddr,

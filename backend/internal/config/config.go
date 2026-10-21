@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,19 @@ const (
 	SignupDisabled = "disabled"
 	SignupInvite   = "invite"
 	SignupOpen     = "open"
+)
+
+// Authentication providers (AUTH_PROVIDER).
+const (
+	AuthLocal            = "local"
+	AuthOIDC             = "oidc"
+	AuthIdentityPlatform = "identity-platform"
+)
+
+// Identity Platform sign-in methods (IDP_SIGN_IN_METHODS).
+const (
+	SignInPassword = "password"
+	SignInGoogle   = "google"
 )
 
 // Config is the complete, validated runtime configuration.
@@ -43,6 +57,28 @@ type Config struct {
 	MaxFailedLogins     int
 	LockoutDuration     time.Duration
 	RateLimitPerMinute  int
+
+	// AuthProvider selects the identity backend: local, oidc or identity-platform.
+	AuthProvider string
+
+	// AUTH_PROVIDER=oidc: the API is a confidential OIDC client (BFF).
+	OIDCIssuerURL             string
+	OIDCClientID              string
+	OIDCClientSecret          string
+	OIDCRedirectURL           string
+	OIDCScopes                []string
+	OIDCProviderName          string
+	OIDCLogoutURL             string // template with {client_id} and {post_logout_redirect_uri}
+	OIDCPostLogoutRedirectURL string
+	OIDCDiscoveryURL          string // dev only: where to fetch discovery from
+
+	// AUTH_PROVIDER=identity-platform (GCP). The API key is public by design:
+	// it is sent to the browser.
+	IDPProjectID     string
+	IDPAPIKey        string
+	IDPAuthDomain    string
+	IDPTenantID      string
+	IDPSignInMethods []string
 }
 
 // Load builds a Config. getenv and readFile are injected for testability.
@@ -76,9 +112,18 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 	}
 	c.PublicSharing = l.boolean("FEATURE_PUBLIC_SHARING", false)
 	c.PublicAppURL = strings.TrimRight(l.str("PUBLIC_APP_URL", ""), "/")
-	if c.PublicSharing {
+	c.AuthProvider = strings.ToLower(l.str("AUTH_PROVIDER", AuthLocal))
+	if !oneOf(c.AuthProvider, AuthLocal, AuthOIDC, AuthIdentityPlatform) {
+		l.errf("AUTH_PROVIDER must be one of local|oidc|identity-platform, got %q", c.AuthProvider)
+	}
+	if c.PublicSharing || c.AuthProvider == AuthOIDC {
 		if c.PublicAppURL == "" {
-			l.errf("PUBLIC_APP_URL is required when FEATURE_PUBLIC_SHARING=true")
+			if c.PublicSharing {
+				l.errf("PUBLIC_APP_URL is required when FEATURE_PUBLIC_SHARING=true")
+			}
+			if c.AuthProvider == AuthOIDC {
+				l.errf("PUBLIC_APP_URL is required when AUTH_PROVIDER=oidc")
+			}
 		} else if u, err := url.Parse(c.PublicAppURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			l.errf("PUBLIC_APP_URL must be an absolute http(s) URL, got %q", c.PublicAppURL)
 		}
@@ -102,6 +147,13 @@ func Load(getenv func(string) string, readFile func(string) ([]byte, error)) (Co
 	c.MaxFailedLogins = l.integer("AUTH_MAX_FAILED_LOGINS", 5, 1)
 	c.LockoutDuration = l.duration("AUTH_LOCKOUT_DURATION", 15*time.Minute, true)
 	c.RateLimitPerMinute = l.integer("AUTH_RATE_LIMIT_PER_MINUTE", 10, 1)
+
+	switch c.AuthProvider {
+	case AuthOIDC:
+		l.oidc(&c)
+	case AuthIdentityPlatform:
+		l.identityPlatform(&c)
+	}
 
 	if len(l.errs) > 0 {
 		return Config{}, errors.Join(l.errs...)
@@ -190,6 +242,107 @@ func (l *loader) boolean(name string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// oidc reads and validates the OIDC_* settings. It runs after the session and
+// public URL settings because the redirect defaults and the http exception
+// depend on them.
+func (l *loader) oidc(c *Config) {
+	c.OIDCIssuerURL = l.str("OIDC_ISSUER_URL", "")
+	l.requireURL("OIDC_ISSUER_URL", c.OIDCIssuerURL, c.SessionCookieSecure, true)
+	c.OIDCClientID = l.str("OIDC_CLIENT_ID", "")
+	if c.OIDCClientID == "" {
+		l.errf("OIDC_CLIENT_ID is required when AUTH_PROVIDER=oidc")
+	}
+	c.OIDCClientSecret = l.secret("OIDC_CLIENT_SECRET")
+	if c.OIDCClientSecret == "" {
+		l.errf("OIDC_CLIENT_SECRET (or OIDC_CLIENT_SECRET_FILE) is required when AUTH_PROVIDER=oidc")
+	}
+
+	c.OIDCRedirectURL = l.str("OIDC_REDIRECT_URL", "")
+	if c.OIDCRedirectURL == "" && c.PublicAppURL != "" {
+		c.OIDCRedirectURL = c.PublicAppURL + c.APIBasePath + "/auth/oidc/callback"
+	}
+	l.requireURL("OIDC_REDIRECT_URL", c.OIDCRedirectURL, c.SessionCookieSecure, false)
+
+	c.OIDCScopes = strings.Fields(l.str("OIDC_SCOPES", "openid email profile"))
+	if !slices.Contains(c.OIDCScopes, "openid") {
+		l.errf("OIDC_SCOPES must contain openid, got %q", strings.Join(c.OIDCScopes, " "))
+	}
+	c.OIDCProviderName = l.str("OIDC_PROVIDER_NAME", "Single sign-on")
+
+	c.OIDCLogoutURL = l.str("OIDC_LOGOUT_URL", "")
+	if c.OIDCLogoutURL != "" {
+		// Placeholders are substituted before the shape check.
+		probe := strings.NewReplacer("{client_id}", "x", "{post_logout_redirect_uri}", "x").Replace(c.OIDCLogoutURL)
+		l.requireURL("OIDC_LOGOUT_URL", probe, c.SessionCookieSecure, false)
+	}
+	c.OIDCPostLogoutRedirectURL = l.str("OIDC_POST_LOGOUT_REDIRECT_URL", "")
+	if c.OIDCPostLogoutRedirectURL == "" && c.PublicAppURL != "" {
+		c.OIDCPostLogoutRedirectURL = c.PublicAppURL + "/login"
+	}
+	l.requireURL("OIDC_POST_LOGOUT_REDIRECT_URL", c.OIDCPostLogoutRedirectURL, c.SessionCookieSecure, false)
+
+	c.OIDCDiscoveryURL = l.str("OIDC_DISCOVERY_URL", "")
+	if c.OIDCDiscoveryURL != "" {
+		l.requireURL("OIDC_DISCOVERY_URL", c.OIDCDiscoveryURL, c.SessionCookieSecure, false)
+	}
+}
+
+// requireURL checks that raw is an absolute https URL (http only when the
+// deployment runs without Secure cookies, i.e. local development). An empty
+// value is an error only when the setting is required or was derived; callers
+// that default from PUBLIC_APP_URL have already reported that one missing.
+func (l *loader) requireURL(name, raw string, secure, required bool) {
+	if raw == "" {
+		if required {
+			l.errf("%s is required when AUTH_PROVIDER=oidc", name)
+		}
+		return
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.Fragment != "" {
+		l.errf("%s must be an absolute URL without a fragment, got %q", name, raw)
+		return
+	}
+	if u.Scheme != "https" && (u.Scheme != "http" || secure) {
+		l.errf("%s must use https (http is allowed only with SESSION_COOKIE_SECURE=false), got %q", name, raw)
+	}
+}
+
+// identityPlatform reads and validates the IDP_* settings.
+func (l *loader) identityPlatform(c *Config) {
+	for _, f := range []struct {
+		name string
+		dst  *string
+	}{
+		{"IDP_PROJECT_ID", &c.IDPProjectID},
+		{"IDP_API_KEY", &c.IDPAPIKey},
+		{"IDP_AUTH_DOMAIN", &c.IDPAuthDomain},
+	} {
+		if *f.dst = l.str(f.name, ""); *f.dst == "" {
+			l.errf("%s is required when AUTH_PROVIDER=identity-platform", f.name)
+		}
+	}
+	if d := c.IDPAuthDomain; d != "" {
+		if u, err := url.Parse("https://" + d); err != nil || u.Host != d || u.Hostname() == "" || strings.Contains(d, ":") {
+			l.errf("IDP_AUTH_DOMAIN must be a bare host name such as <project>.firebaseapp.com, got %q", d)
+		}
+	}
+	c.IDPTenantID = l.str("IDP_TENANT_ID", "")
+	for _, m := range strings.Split(l.str("IDP_SIGN_IN_METHODS", SignInPassword), ",") {
+		m = strings.ToLower(strings.TrimSpace(m))
+		switch {
+		case m == "":
+		case !oneOf(m, SignInPassword, SignInGoogle):
+			l.errf("IDP_SIGN_IN_METHODS entries must be password or google, got %q", m)
+		case !slices.Contains(c.IDPSignInMethods, m):
+			c.IDPSignInMethods = append(c.IDPSignInMethods, m)
+		}
+	}
+	if len(c.IDPSignInMethods) == 0 {
+		l.errf("IDP_SIGN_IN_METHODS must list at least one of password,google")
+	}
 }
 
 // database resolves DATABASE_URL or assembles a DSN from DB_* variables.
