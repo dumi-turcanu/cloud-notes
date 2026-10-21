@@ -43,10 +43,13 @@ type HandlerConfig struct {
 	// OIDC is required for the OIDC handlers (AUTH_PROVIDER=oidc); when set,
 	// logout also returns the provider's logout URL.
 	OIDC *OIDCClient
+	// IdentityPlatform is required for CreateSession (AUTH_PROVIDER=identity-platform).
+	IdentityPlatform *IdentityPlatformVerifier
 }
 
 // Handlers serves /auth/register, /auth/login, /auth/logout and /auth/me, and
-// in oidc mode /auth/oidc/login and /auth/oidc/callback.
+// in oidc mode /auth/oidc/login and /auth/oidc/callback, or in identity-platform
+// mode /auth/session.
 type Handlers struct {
 	flow Flow
 	cfg  HandlerConfig

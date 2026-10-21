@@ -23,6 +23,8 @@ const (
 	CodeInvalidInviteCode  = "invalid_invite_code"
 	CodeInvalidCredentials = "invalid_credentials"
 	CodeEmailTaken         = "email_taken"
+	CodeInvalidToken       = "invalid_token"
+	CodeAccountConflict    = "account_conflict"
 	CodeNotFound           = "not_found"
 	CodeMethodNotAllowed   = "method_not_allowed"
 	CodeTooManyRequests    = "too_many_requests"

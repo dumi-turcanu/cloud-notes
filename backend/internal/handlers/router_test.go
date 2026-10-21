@@ -571,3 +571,19 @@ func TestOIDCEndpointsAreMountedOnlyInOIDCMode(t *testing.T) {
 		t.Error("oidc redirects must not be cached")
 	}
 }
+
+func TestSessionEndpointIsMountedOnlyInIdentityPlatformMode(t *testing.T) {
+	for _, provider := range []string{"", config.AuthLocal, config.AuthOIDC} {
+		e := newEnv(t, func(c *config.Config) { c.AuthProvider = provider })
+		wantError(t, (&client{e: e}).do("POST", "/api/auth/session", `{"id_token":"x"}`), 404, "not_found")
+	}
+
+	e := newEnv(t, func(c *config.Config) {
+		c.AuthProvider, c.IDPProjectID, c.IDPSignInMethods = config.AuthIdentityPlatform, "p", []string{"password"}
+	})
+	c := &client{e: e}
+	// Mounted, and a token that is not a JWT is refused before any key fetch.
+	wantError(t, c.do("POST", "/api/auth/session", `{"id_token":"not-a-jwt"}`), 401, "invalid_token")
+	// Same CSRF protection as every other mutation.
+	wantError(t, c.do("POST", "/api/auth/session", `{"id_token":"x"}`, "Sec-Fetch-Site", "cross-site"), 403, "forbidden")
+}

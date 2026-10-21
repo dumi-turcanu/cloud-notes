@@ -7,9 +7,29 @@ export interface User {
 
 export type SignupMode = 'disabled' | 'invite' | 'open'
 
+export type AuthProviderKind = 'local' | 'oidc' | 'identity-platform'
+
+/** Firebase web configuration for GCP Identity Platform. The API key is public by design. */
+export interface IdentityPlatformConfig {
+  api_key: string
+  auth_domain: string
+  project_id: string
+  tenant_id?: string
+  sign_in_methods: Array<'password' | 'google'>
+}
+
+export interface AuthConfig {
+  provider: AuthProviderKind
+  /** Label of the single sign-on button (oidc). */
+  display_name?: string
+  identity_platform?: IdentityPlatformConfig
+}
+
 export interface AppConfig {
   signup_mode: SignupMode
   features: { public_sharing: boolean }
+  /** Absent when talking to an older API: treat as `local`. */
+  auth?: AuthConfig
   version: string
 }
 

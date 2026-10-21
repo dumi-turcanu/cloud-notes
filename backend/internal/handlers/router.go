@@ -32,6 +32,9 @@ type Deps struct {
 	// OIDC is optional; when nil and AUTH_PROVIDER=oidc it is built from the
 	// configuration. Tests inject one pointed at a fake provider.
 	OIDC *auth.OIDCClient
+	// IdentityPlatform is optional; when nil and AUTH_PROVIDER=identity-platform
+	// it is built from the configuration (keys are fetched lazily from Google).
+	IdentityPlatform *auth.IdentityPlatformVerifier
 	// Recorder is optional; it receives auth outcomes for metrics.
 	Recorder auth.Recorder
 	// Metrics is optional; when set, requests are counted per route pattern.
@@ -111,6 +114,13 @@ func newAPIHandler(d Deps) (http.Handler, error) {
 	if oidcClient == nil && cfg.AuthProvider == config.AuthOIDC {
 		oidcClient = auth.NewOIDCClient(auth.OIDCSettingsFromConfig(cfg))
 	}
+	var idpVerifier *auth.IdentityPlatformVerifier
+	if cfg.AuthProvider == config.AuthIdentityPlatform {
+		idpVerifier = d.IdentityPlatform
+		if idpVerifier == nil {
+			idpVerifier = auth.NewIdentityPlatformVerifier(auth.IdentityPlatformSettingsFromConfig(cfg))
+		}
+	}
 	authH := auth.NewHandlers(d.Auth, auth.HandlerConfig{
 		SecureCookie: cfg.SessionCookieSecure,
 		ProxyHops:    cfg.TrustedProxyHops,
@@ -118,6 +128,8 @@ func newAPIHandler(d Deps) (http.Handler, error) {
 		Recorder:     d.Recorder,
 		Now:          now,
 		OIDC:         oidcClient,
+
+		IdentityPlatform: idpVerifier,
 	})
 	require := auth.RequireSession(d.Auth, cfg.SessionCookieSecure)
 	notes := NewNoteHandler(d.Notes, cfg.PublicAppURL)
@@ -135,6 +147,9 @@ func newAPIHandler(d Deps) (http.Handler, error) {
 		if !externalAuth(cfg) {
 			r.Post("/register", authH.Register)
 			r.Post("/login", authH.Login)
+		}
+		if idpVerifier != nil {
+			r.Post("/session", authH.CreateSession)
 		}
 		if oidcClient != nil {
 			r.Get("/oidc/login", authH.OIDCLogin)
