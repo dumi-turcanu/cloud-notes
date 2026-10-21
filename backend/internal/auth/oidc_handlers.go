@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 
 	"github.com/dumi-turcanu/cloud-notes/backend/internal/httpx"
@@ -37,7 +38,7 @@ func (h *Handlers) OIDCLogin(w http.ResponseWriter, r *http.Request) {
 
 	target, err := h.cfg.OIDC.AuthCodeURL(r.Context(), st.State, st.Nonce, st.Verifier)
 	if err != nil {
-		h.logOIDCFailure(r, "login_start", reasonDiscovery)
+		h.logOIDCFailure(r, "login_start", reasonDiscovery, discoveryAttrs(err)...)
 		h.cfg.Recorder.LoginAttempt("oidc_failed")
 		h.loginRedirect(w, r, oidcErrFailed)
 		return
@@ -127,8 +128,19 @@ func (h *Handlers) callbackFailed(w http.ResponseWriter, r *http.Request, reason
 
 // logOIDCFailure logs only the stage and a fixed reason code. Authorization
 // codes, tokens and provider error text never reach the log.
-func (h *Handlers) logOIDCFailure(r *http.Request, stage, reason string) {
-	slog.WarnContext(r.Context(), "oidc login failed", "stage", stage, "reason", reason)
+func (h *Handlers) logOIDCFailure(r *http.Request, stage, reason string, attrs ...any) {
+	slog.WarnContext(r.Context(), "oidc login failed", append([]any{"stage", stage, "reason", reason}, attrs...)...)
+}
+
+// discoveryAttrs adds the one detail of a discovery failure that is safe and
+// by far the most useful: when the provider's issuer differs from
+// OIDC_ISSUER_URL, both are public configuration values, not secrets.
+func discoveryAttrs(err error) []any {
+	var mismatch *oidc.IssuerMismatchError
+	if errors.As(err, &mismatch) {
+		return []any{"configured_issuer", mismatch.Provided, "discovered_issuer", mismatch.Discovered}
+	}
+	return nil
 }
 
 // loginRedirect sends the browser to the SPA's login page with an error code.

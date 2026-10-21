@@ -465,8 +465,19 @@ func TestOIDCDiscoveryURLKeepsCheckingThePublicIssuer(t *testing.T) {
 }
 
 func TestOIDCIssuerMismatchInDiscoveryFails(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
 	o := newOIDCFixture(t, false, 100, func(o *oidcFixture, s *OIDCSettings) { o.idp.Issuer = "https://other.example" })
 	wantRedirect(t, o.do("GET", "/oidc/login"), "/login?error=oidc_failed")
+
+	// The one detail that is logged: both issuers are public configuration, and
+	// the mismatch is the most common setup mistake.
+	if out := logs.String(); !strings.Contains(out, "configured_issuer="+o.idp.URL) || !strings.Contains(out, "discovered_issuer=https://other.example") {
+		t.Errorf("issuer mismatch not logged: %q", out)
+	}
 }
 
 func TestOIDCLogoutURL(t *testing.T) {
