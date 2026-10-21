@@ -8,9 +8,19 @@ info:
     **same origin** as the web UI. Responses are JSON with snake_case field names and RFC 3339 UTC
     timestamps. Every non-2xx response from `/api` uses the [`Error`](#/components/schemas/Error) shape.
 
-    Authentication is a server-side session: `POST /api/auth/login` (or `register`) sets an
-    `HttpOnly`, `SameSite=Strict` cookie. It is named `__Host-cn_session` when the backend runs with
-    `SESSION_COOKIE_SECURE=true` (the default; requires HTTPS) and `cn_session` otherwise.
+    Authentication is a server-side session: signing in sets an `HttpOnly`, `SameSite=Strict`
+    cookie. It is named `__Host-cn_session` when the backend runs with `SESSION_COOKIE_SECURE=true`
+    (the default; requires HTTPS) and `cn_session` otherwise. How a user signs in depends on the
+    backend's `AUTH_PROVIDER`, which `GET /api/config` reports in `auth.provider`:
+
+    - `local` (default): e-mail and password, `POST /api/auth/login` and `/api/auth/register`.
+    - `oidc`: the API is an OpenID Connect client (AWS Cognito, Azure Entra External ID, Keycloak, …);
+      the browser is redirected through `GET /api/auth/oidc/login` and `/api/auth/oidc/callback`.
+    - `identity-platform` (GCP): the web UI signs in with the Firebase SDK and posts the ID token to
+      `POST /api/auth/session`.
+
+    Routes of the modes that are not active do not exist and answer `404 not_found`. In every mode the
+    result is the same session cookie, and everything below `/api/notes` works identically.
 
     State-changing requests are protected against CSRF (`403 forbidden` for cross-site browser
     requests). Request bodies are limited to 256 KiB and unknown JSON fields are rejected.
@@ -25,7 +35,7 @@ tags:
   - name: config
     description: Public configuration used by the web UI.
   - name: auth
-    description: Registration, sign-in and sign-out.
+    description: Registration, sign-in (local, OpenID Connect or Identity Platform) and sign-out.
   - name: notes
     description: Notes of the signed-in user.
   - name: sharing
@@ -128,7 +138,8 @@ paths:
       operationId: register
       summary: Create an account and sign in
       description: |
-        Only available when the sign-up mode is `open`, or `invite` with a valid `invite_code`.
+        Only available with `AUTH_PROVIDER=local` (otherwise `404 not_found`), and when the sign-up
+        mode is `open`, or `invite` with a valid `invite_code`.
         Subject to the per-IP rate limit. On success a session cookie is set.
       security: []
       requestBody:
@@ -179,6 +190,7 @@ paths:
       operationId: login
       summary: Sign in
       description: |
+        Only available with `AUTH_PROVIDER=local` (otherwise `404 not_found`).
         Verifies the credentials and starts a new session. A session cookie presented on the request is
         revoked first. After `AUTH_MAX_FAILED_LOGINS` consecutive failures the account is locked for
         `AUTH_LOCKOUT_DURATION` (`429 too_many_attempts`). Unknown e-mails and wrong passwords both
@@ -230,9 +242,26 @@ paths:
       tags: [auth]
       operationId: logout
       summary: Sign out
-      description: Deletes the session if one is presented and clears the cookie. Always answers `204`.
+      description: |
+        Deletes the session if one is presented and clears the cookie. Answers `204`, except with
+        `AUTH_PROVIDER=oidc` when the identity provider has a logout URL (`OIDC_LOGOUT_URL` or the
+        discovered `end_session_endpoint`): then `200` with that URL, which the web UI navigates to so
+        the provider's own session ends too.
       security: []
       responses:
+        "200":
+          description: Signed out locally; the identity provider's logout URL follows (`oidc` only).
+          headers:
+            Set-Cookie:
+              description: Expires the session cookie.
+              schema:
+                type: string
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogoutResponse"
         "204":
           description: Signed out (also when there was no session).
           headers:
@@ -244,6 +273,144 @@ paths:
               $ref: "#/components/headers/NoStore"
         "403":
           $ref: "#/components/responses/Forbidden"
+  /api/auth/session:
+    post:
+      tags: [auth]
+      operationId: createSession
+      summary: Sign in with an Identity Platform ID token
+      description: |
+        Only available with `AUTH_PROVIDER=identity-platform` (otherwise `404 not_found`). The web UI
+        signs in with the Firebase Auth SDK and posts the fresh ID token here. The server verifies the
+        signature (Google's securetoken keys), issuer `https://securetoken.google.com/<project>`,
+        audience `<project>`, expiry, that the sign-in happened at most 5 minutes ago (`auth_time`),
+        the tenant (`IDP_TENANT_ID`, if set) and that the sign-in method is enabled
+        (`IDP_SIGN_IN_METHODS`). The user is keyed on the token's `(iss, sub)`; an existing session on
+        the request is revoked first. Subject to the per-IP rate limit.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionRequest"
+      responses:
+        "200":
+          description: Signed in.
+          headers:
+            Set-Cookie:
+              $ref: "#/components/headers/SetSessionCookie"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: The token is not valid for any reason (`invalid_token`). The reason is never disclosed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The token's e-mail address belongs to a different account (`account_conflict`). Accounts are never linked by e-mail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /api/auth/oidc/login:
+    get:
+      tags: [auth]
+      operationId: oidcLogin
+      summary: Start an OpenID Connect sign-in
+      description: |
+        Only available with `AUTH_PROVIDER=oidc` (otherwise `404 not_found`). A browser navigation, not
+        an XHR. Generates `state`, `nonce` and a PKCE verifier, stores them in the short-lived
+        `__Host-cn_oidc` cookie (`cn_oidc` without `SESSION_COOKIE_SECURE`; `HttpOnly`,
+        `SameSite=Lax`, 10 minutes) and redirects to the provider's authorization endpoint
+        (authorization code flow with PKCE S256). If the provider cannot be reached the redirect goes
+        to `/login?error=oidc_failed` instead.
+      security: []
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: |
+            Path to return to after signing in. Anything that is not a same-site absolute path
+            (must start with `/`, not `//` or `/\`, no control characters, at most 2048 bytes) is
+            replaced by `/`.
+          schema:
+            type: string
+            examples: [/trash]
+      responses:
+        "302":
+          description: Redirect to the identity provider (or to `/login?error=oidc_failed`).
+          headers:
+            Location:
+              schema:
+                type: string
+            Set-Cookie:
+              description: The login state cookie.
+              schema:
+                type: string
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+  /api/auth/oidc/callback:
+    get:
+      tags: [auth]
+      operationId: oidcCallback
+      summary: Finish an OpenID Connect sign-in
+      description: |
+        Only available with `AUTH_PROVIDER=oidc` (otherwise `404 not_found`). The redirect URI that
+        is registered with the identity provider. Subject to the per-IP rate limit (`429`, JSON).
+        Checks `state` against the login state cookie, redeems the authorization code with the PKCE
+        verifier, verifies the ID token (signature, issuer, audience, expiry, nonce) and signs the user
+        in, keyed on `(iss, sub)`. The state cookie is deleted whatever the outcome.
+
+        The response is always a redirect to a relative path and never carries provider error details:
+        the requested page (the `from` of the login) on success, with the session cookie set, or
+        `/login?error=<code>` with one of `oidc_cancelled` (the user or provider cancelled),
+        `oidc_failed` (state, token or provider problem), `account_conflict` (the e-mail belongs to
+        a different account) or `email_claim_missing` (no usable, verified e-mail in the token).
+      security: []
+      parameters:
+        - name: code
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+        - name: error
+          in: query
+          description: Set by the provider when it refuses; the value is ignored.
+          schema:
+            type: string
+      responses:
+        "302":
+          description: Redirect to the requested page, or to `/login?error=<code>`.
+          headers:
+            Location:
+              schema:
+                type: string
+            Set-Cookie:
+              description: The session cookie on success; always expires the login state cookie.
+              schema:
+                type: string
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /api/auth/me:
     get:
       tags: [auth]
@@ -629,6 +796,8 @@ components:
             - invalid_invite_code
             - invalid_credentials
             - email_taken
+            - invalid_token
+            - account_conflict
             - not_found
             - method_not_allowed
             - too_many_requests
@@ -650,11 +819,14 @@ components:
             password: must be 12-128 characters
     AppConfig:
       type: object
-      required: [signup_mode, features, version]
+      required: [signup_mode, features, auth, version]
       properties:
         signup_mode:
           type: string
           enum: [disabled, invite, open]
+          description: Self-service sign-up policy. Only applies with `auth.provider` = `local`.
+        auth:
+          $ref: "#/components/schemas/AuthConfig"
         features:
           type: object
           required: [public_sharing]
@@ -664,6 +836,55 @@ components:
         version:
           type: string
           description: Backend version.
+    AuthConfig:
+      type: object
+      required: [provider]
+      description: How users sign in; the web UI renders the matching sign-in page.
+      properties:
+        provider:
+          type: string
+          enum: [local, oidc, identity-platform]
+        display_name:
+          type: string
+          description: Label of the single sign-on button (`OIDC_PROVIDER_NAME`). Only for `oidc`.
+        identity_platform:
+          $ref: "#/components/schemas/IdentityPlatformConfig"
+    IdentityPlatformConfig:
+      type: object
+      description: Firebase web configuration. Only for `identity-platform`. The API key is public by design (it identifies the project; restrict it by HTTP referrer).
+      required: [api_key, auth_domain, project_id, sign_in_methods]
+      properties:
+        api_key:
+          type: string
+        auth_domain:
+          type: string
+          examples: [my-project.firebaseapp.com]
+        project_id:
+          type: string
+        tenant_id:
+          type: string
+          description: Identity Platform tenant, when multi-tenancy is used.
+        sign_in_methods:
+          type: array
+          items:
+            type: string
+            enum: [password, google]
+    SessionRequest:
+      type: object
+      additionalProperties: false
+      required: [id_token]
+      properties:
+        id_token:
+          type: string
+          description: A fresh Identity Platform (Firebase Auth) ID token.
+    LogoutResponse:
+      type: object
+      required: [logout_url]
+      properties:
+        logout_url:
+          type: string
+          format: uri
+          description: Where to send the browser to end the identity provider's session.
     User:
       type: object
       required: [id, email, display_name, created_at]

@@ -7,8 +7,19 @@ or database, secrets from a secret manager and least-privilege identities.
 
 ## Authentication design
 
-Built-in authentication with e-mail and password. There is no external identity provider, no JWT and
-no token that JavaScript can read.
+Three sign-in modes share one session layer (`AUTH_PROVIDER`, details in
+[authentication.md](authentication.md)): built-in e-mail and password (`local`, the default and the
+subject of the table below), an OpenID Connect provider such as AWS Cognito or Azure Entra External ID
+(`oidc`), and GCP Identity Platform (`identity-platform`). In every mode the browser holds only the
+session cookie below: no token that JavaScript can read is ever stored.
+
+With an external provider the application keeps no passwords; credentials, MFA and account recovery
+are the provider's. The application keys users on `(issuer, subject)` and **never links an external
+identity to an existing account by e-mail** (a clash is refused with `account_conflict`), verifies the
+ID token (signature, issuer, audience, expiry, nonce; Identity Platform also `auth_time` ≤ 5 minutes,
+tenant and sign-in method), ignores an e-mail address the provider marks unverified, never logs or
+redirects with tokens, codes, secrets or provider error text, and rate-limits the callback. Who may
+create an account is decided in the provider, not by `AUTH_SIGNUP_MODE`.
 
 | Aspect | Design |
 | --- | --- |
@@ -18,6 +29,7 @@ no token that JavaScript can read.
 | User enumeration | Login answers `invalid_credentials` for an unknown e-mail and a wrong password alike, and verifies against a dummy hash for unknown users so the response time does not reveal which e-mails exist. Registration necessarily reveals taken e-mails (`email_taken`) when sign-up is enabled. |
 | Sessions | Server-side, in PostgreSQL. The cookie holds 32 random bytes (`crypto/rand`, base64url); the database stores only the **SHA-256 of the token**, so a database leak does not yield usable session cookies. Logging in rotates the session (an existing session on the request is revoked first). Absolute lifetime `SESSION_TTL` (default 12 h) and idle timeout `SESSION_IDLE_TIMEOUT` (default 1 h); expired rows are removed by a background job every 15 minutes. |
 | Cookie | `__Host-cn_session` (the `__Host-` prefix forces `Secure`, `Path=/` and no `Domain`), `HttpOnly`, `Secure`, `SameSite=Strict`, `Max-Age` equal to the remaining lifetime. Plain-HTTP development (`SESSION_COOKIE_SECURE=false`) uses the name `cn_session` without `Secure`. |
+| Cookie-less sign-in state | In `oidc` mode a short-lived `__Host-cn_oidc` cookie (`HttpOnly`, `SameSite=Lax`, 10 minutes, single use) carries `state`, `nonce` and the PKCE verifier between the redirect and the callback. |
 | Authorization | Every note query is scoped to the signed-in user; other users' notes answer `404`. Public sharing exposes only title, content and update time of explicitly published notes, addressed by an unguessable UUID. |
 | Caching | `/api/auth/*` and all authenticated responses carry `Cache-Control: no-store`. |
 
@@ -53,7 +65,8 @@ behind proxies (the `Host` it sees is internal).
 
 ### Sign-up
 
-`AUTH_SIGNUP_MODE=disabled` is the default. Use `invite` (a secret code of at least 16 characters,
+`AUTH_SIGNUP_MODE` only applies to `AUTH_PROVIDER=local`; with an external provider restrict
+sign-up in the provider (see [authentication.md](authentication.md)). `AUTH_SIGNUP_MODE=disabled` is the default. Use `invite` (a secret code of at least 16 characters,
 compared in constant time) or create users with `cloud-notes-api create-user`. `open` is for local
 development only.
 
@@ -74,7 +87,10 @@ sensitive anyway (client IPs, user ids).
 
 | Threat | Mitigation in the application | What the deployment must provide |
 | --- | --- | --- |
-| Credential stuffing / brute force | Argon2id, lockout, per-IP limit, generic login errors | WAF rate-limiting rules on `/api/auth/*`; alarms on `auth_login_attempts_total` |
+| Credential stuffing / brute force | Argon2id, lockout, per-IP limit, generic login errors (`local`); the provider's protections plus a per-IP limit on the callback (`oidc`, `identity-platform`) | WAF rate-limiting rules on `/api/auth/*`; alarms on `auth_login_attempts_total` |
+| Account takeover through a matching e-mail at an identity provider | Users keyed on `(issuer, subject)`; no linking by e-mail, a clash is `account_conflict`; unverified e-mail ignored | Restrict who can sign up in the provider; require verified e-mail there |
+| Login CSRF / authorization-code injection (`oidc`) | PKCE S256, `state` bound to the browser by a cookie, `nonce`, single-use state | HTTPS and exact redirect URIs registered at the provider |
+| Replay of a captured Identity Platform token | `auth_time` ≤ 5 minutes, expiry, audience and issuer checks | Restrict the Web API key by HTTP referrer |
 | Stolen database / backup | Only password hashes and SHA-256 session hashes are stored | Encryption at rest, access control, backup protection |
 | Session theft | `HttpOnly`, `Secure`, `SameSite=Strict`, `__Host-` cookie, short idle timeout, CSP | HTTPS everywhere, HSTS at the edge |
 | CSRF | `CrossOriginProtection`, `SameSite=Strict`, no CORS | Do not add permissive CORS headers at the edge |
@@ -92,10 +108,13 @@ sensitive anyway (client IPs, user ids).
 
 These are deliberate scope decisions; the application does not provide the following.
 
-- **No e-mail verification.** Addresses are not confirmed; any syntactically valid address is accepted.
-- **No password reset or change.** A forgotten password is replaced by an operator (for a new
-  account via `create-user`). There is no self-service flow, no e-mail sending.
-- **No multi-factor authentication.**
+- **No e-mail verification** in `local` mode. Addresses are not confirmed; any syntactically valid
+  address is accepted. (With an external provider, verification and MFA are the provider's job; Identity
+  Platform password sign-ups are not verified unless you add that to the project.)
+- **No password reset or change** in `local` mode. A forgotten password is replaced by an operator (for a
+  new account via `create-user`). There is no self-service flow, no e-mail sending. (Identity Platform
+  mode has "Forgot password?" through the provider; Cognito and Entra offer recovery on their pages.)
+- **No multi-factor authentication** in `local` mode; enable it in the identity provider otherwise.
 - **No user management UI or API.** No user deletion, no session listing or "sign out everywhere".
 - **Per-instance rate limiter.** Limits are not shared between replicas, and a restart clears them.
 - **Lockout can be abused** to lock a known user out temporarily (see above).
@@ -109,7 +128,9 @@ These are deliberate scope decisions; the application does not provide the follo
 
 For anyone deploying the application to a shared or public environment.
 
-- [ ] Sign-up is `disabled` (or `invite` with a secret code); `SESSION_COOKIE_SECURE` is `true`.
+- [ ] Sign-up is `disabled` (or `invite` with a secret code); `SESSION_COOKIE_SECURE` is `true`. With
+      `AUTH_PROVIDER=oidc` or `identity-platform`, self-service sign-up is restricted in the identity provider
+      and `OIDC_CLIENT_SECRET` comes from the secret manager.
 - [ ] HTTPS only; the edge redirects HTTP to HTTPS and sends HSTS.
 - [ ] **WAF rate limiting** on `/api/auth/*` (and a general request rate limit) at the edge.
 - [ ] Frontend origin reachable only from the edge; backend and database have no public address.

@@ -17,14 +17,16 @@ TypeScript 6, ESLint 10, Vitest 5 with Testing Library and happy-dom. Node.js 24
 
 | Route | Purpose |
 | --- | --- |
-| `/login` | Sign in |
-| `/register` | Create an account; hidden when sign-up is disabled, asks for an invite code in invite mode |
+| `/login` | Sign in: e-mail + password (`local`), one "Sign in with …" button (`oidc`), or e-mail + password / Google through the Firebase SDK (`identity-platform`) |
+| `/register` | Create an account (`local`: hidden when sign-up is disabled, invite code in invite mode; `identity-platform`: through the SDK); redirects to `/login` with `oidc` |
 | `/` | Notes: list, create, edit, delete, publish/unpublish (if enabled) |
 | `/trash` | Deleted notes: restore |
 | `/shared/:shareUuid` | Public read-only note (only when public sharing is enabled) |
 
 Anonymous visitors are redirected to `/login` and back after signing in. Note text is rendered as
-plain text.
+plain text. The sign-in page follows `auth.provider` from `GET /api/config`; the Firebase SDK is only
+downloaded (separate lazy chunks) when that is `identity-platform`. See
+[../docs/authentication.md](../docs/authentication.md).
 
 ## Local development
 
@@ -69,5 +71,8 @@ docker run --rm -p 3000:8080 -e API_UPSTREAM=http://host.docker.internal:8080 cl
 - `/api/` is proxied without rewriting, `/healthz` answers `200` without calling the backend, unknown
   paths fall back to `index.html`, `/assets/*` is cached as immutable.
 - Sends a strict Content-Security-Policy and other security headers; the SPA therefore contains no
-  inline scripts or styles.
-- nginx configuration lives in `nginx/` (template, headers snippet, entrypoint validation script).
+  inline scripts or styles. `FRONTEND_AUTH_PROFILE=identity-platform` (with `IDP_AUTH_DOMAIN` and
+  `IDP_SIGN_IN_METHODS`) adds the hosts the Firebase Auth SDK needs; the default `none` keeps the
+  strict policy byte for byte.
+- nginx configuration lives in `nginx/` (template, headers template, entrypoint validation script that
+  renders the upstream and header includes into `/etc/nginx/conf.d` at start).

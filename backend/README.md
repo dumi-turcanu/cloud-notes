@@ -1,13 +1,15 @@
 # Cloud Notes backend
 
-Go REST API for Cloud Notes: e-mail + password sign-in with server-side sessions in PostgreSQL,
-notes with trash and optional public sharing, Prometheus metrics. One static binary,
+Go REST API for Cloud Notes: sign-in with server-side sessions in PostgreSQL (e-mail + password, or
+an OpenID Connect / GCP Identity Platform provider chosen by `AUTH_PROVIDER`), notes with trash and
+optional public sharing, Prometheus metrics. One static binary,
 `cloud-notes-api`, packaged in a distroless image (`cloud-notes-backend`).
 
 - Module: `github.com/dumi-turcanu/cloud-notes/backend` (Go 1.27)
 - Configuration, commands, ports, metrics: [../docs/configuration.md](../docs/configuration.md)
 - HTTP API: [../docs/api/openapi.yaml](../docs/api/openapi.yaml)
-- Authentication design: [../docs/security.md](../docs/security.md)
+- Authentication modes and cloud setup: [../docs/authentication.md](../docs/authentication.md)
+- Security design: [../docs/security.md](../docs/security.md)
 
 ## Layout
 
@@ -15,7 +17,9 @@ notes with trash and optional public sharing, Prometheus metrics. One static bin
 cmd/api/                 entry point and subcommands (serve, migrate, create-user, healthcheck, version)
 internal/config/         environment loading (with *_FILE secrets) and validation
 internal/database/       connection pool, embedded migrations, user/session/note repositories
-internal/auth/           Argon2id hashing, sessions, lockout, rate limit, client IP, middleware, handlers
+internal/auth/           Argon2id hashing, sessions, lockout, rate limit, client IP, middleware, handlers,
+                         OIDC client (oidc*.go), Identity Platform verifier (identityplatform*.go)
+internal/auth/oidctest/  in-process fake OpenID Connect provider and JWT signer for tests
 internal/handlers/       router, notes, health endpoints, public config
 internal/observability/  JSON logging, request logging, Prometheus metrics
 internal/server/         listeners, graceful shutdown
@@ -42,6 +46,11 @@ Create a user without open sign-up:
 ```bash
 NEW_USER_PASSWORD='a-long-local-password' make create-user EMAIL=you@example.com
 ```
+
+`create-user` only works with `AUTH_PROVIDER=local`. To run the API against an OpenID Connect
+provider locally use `make up-oidc` at the repository root (Keycloak, see
+[../docs/authentication.md](../docs/authentication.md)); the OIDC and Identity Platform code is tested
+with `internal/auth/oidctest`, so `make test` needs no network and no provider.
 
 For hot reload of the UI against this backend run `npm run dev` in `../frontend`.
 
