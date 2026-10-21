@@ -29,6 +29,9 @@ type Deps struct {
 	DB      Pinger
 	Notes   NoteRepository
 	Auth    auth.Flow
+	// OIDC is optional; when nil and AUTH_PROVIDER=oidc it is built from the
+	// configuration. Tests inject one pointed at a fake provider.
+	OIDC *auth.OIDCClient
 	// Recorder is optional; it receives auth outcomes for metrics.
 	Recorder auth.Recorder
 	// Metrics is optional; when set, requests are counted per route pattern.
@@ -104,12 +107,17 @@ func newAPIHandler(d Deps) (http.Handler, error) {
 		now = time.Now
 	}
 	limiter := auth.NewRateLimiter(cfg.RateLimitPerMinute, now)
+	oidcClient := d.OIDC
+	if oidcClient == nil && cfg.AuthProvider == config.AuthOIDC {
+		oidcClient = auth.NewOIDCClient(auth.OIDCSettingsFromConfig(cfg))
+	}
 	authH := auth.NewHandlers(d.Auth, auth.HandlerConfig{
 		SecureCookie: cfg.SessionCookieSecure,
 		ProxyHops:    cfg.TrustedProxyHops,
 		Limiter:      limiter,
 		Recorder:     d.Recorder,
 		Now:          now,
+		OIDC:         oidcClient,
 	})
 	require := auth.RequireSession(d.Auth, cfg.SessionCookieSecure)
 	notes := NewNoteHandler(d.Notes, cfg.PublicAppURL)
@@ -127,6 +135,10 @@ func newAPIHandler(d Deps) (http.Handler, error) {
 		if !externalAuth(cfg) {
 			r.Post("/register", authH.Register)
 			r.Post("/login", authH.Login)
+		}
+		if oidcClient != nil {
+			r.Get("/oidc/login", authH.OIDCLogin)
+			r.Get("/oidc/callback", authH.OIDCCallback)
 		}
 		r.Post("/logout", authH.Logout)
 		r.With(require).Get("/me", authH.Me)

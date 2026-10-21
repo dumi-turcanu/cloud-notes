@@ -546,3 +546,28 @@ func TestPasswordEndpointsAreNotMountedWithExternalProvider(t *testing.T) {
 		})
 	}
 }
+
+func TestOIDCEndpointsAreMountedOnlyInOIDCMode(t *testing.T) {
+	for _, provider := range []string{"", config.AuthLocal, config.AuthIdentityPlatform} {
+		e := newEnv(t, func(c *config.Config) { c.AuthProvider = provider })
+		for _, p := range []string{"/api/auth/oidc/login", "/api/auth/oidc/callback"} {
+			wantError(t, (&client{e: e}).do("GET", p, ""), 404, "not_found")
+		}
+	}
+
+	// The provider is unreachable (no issuer configured), so a login attempt
+	// ends on the SPA's login page; the point is that the route exists.
+	e := newEnv(t, func(c *config.Config) { c.AuthProvider = config.AuthOIDC })
+	c := &client{e: e}
+	rr := c.do("GET", "/api/auth/oidc/login?from=/trash", "")
+	if rr.Code != http.StatusFound || rr.Header().Get("Location") != "/login?error=oidc_failed" {
+		t.Errorf("login: %d %q", rr.Code, rr.Header().Get("Location"))
+	}
+	rr = c.do("GET", "/api/auth/oidc/callback?error=access_denied", "")
+	if rr.Code != http.StatusFound || rr.Header().Get("Location") != "/login?error=oidc_cancelled" {
+		t.Errorf("callback: %d %q", rr.Code, rr.Header().Get("Location"))
+	}
+	if rr.Header().Get("Cache-Control") != "no-store" {
+		t.Error("oidc redirects must not be cached")
+	}
+}

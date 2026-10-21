@@ -18,6 +18,7 @@ type Flow interface {
 	Authenticator
 	Register(ctx context.Context, req models.RegisterRequest, meta ClientMeta) (*Issued, error)
 	Login(ctx context.Context, email, password string, meta ClientMeta) (*Issued, error)
+	LoginExternal(ctx context.Context, id ExternalIdentity, meta ClientMeta) (*Issued, error)
 	Logout(ctx context.Context, token string) error
 }
 
@@ -39,9 +40,13 @@ type HandlerConfig struct {
 	Limiter      *RateLimiter // optional
 	Recorder     Recorder     // optional
 	Now          func() time.Time
+	// OIDC is required for the OIDC handlers (AUTH_PROVIDER=oidc); when set,
+	// logout also returns the provider's logout URL.
+	OIDC *OIDCClient
 }
 
-// Handlers serves /auth/register, /auth/login, /auth/logout and /auth/me.
+// Handlers serves /auth/register, /auth/login, /auth/logout and /auth/me, and
+// in oidc mode /auth/oidc/login and /auth/oidc/callback.
 type Handlers struct {
 	flow Flow
 	cfg  HandlerConfig
@@ -146,7 +151,9 @@ func (h *Handlers) Login(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, issued.User)
 }
 
-// Logout handles POST /auth/logout. It always answers 204.
+// Logout handles POST /auth/logout. The local session is always revoked. It
+// answers 204, except in oidc mode when the provider has a logout URL: then
+// 200 {"logout_url": ...} so the SPA can end the provider session too.
 func (h *Handlers) Logout(w http.ResponseWriter, r *http.Request) {
 	if token := TokenFromRequest(r, h.cfg.SecureCookie); token != "" {
 		if err := h.flow.Logout(r.Context(), token); err != nil {
@@ -154,6 +161,12 @@ func (h *Handlers) Logout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	ClearSessionCookie(w, h.cfg.SecureCookie)
+	if h.cfg.OIDC != nil {
+		if u, ok := h.cfg.OIDC.LogoutURL(r.Context()); ok {
+			httpx.WriteJSON(w, http.StatusOK, map[string]string{"logout_url": u})
+			return
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
