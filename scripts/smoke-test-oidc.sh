@@ -81,17 +81,28 @@ status_is() { [ "$STATUS" = "$1" ]; }
 body_has() { jq -e "$@" "$BODY"; }
 final_url_is() { [ "$FINAL_URL" = "$1" ]; }
 
-# form_action: the action URL of the provider's login form in $BODY, with the
-# HTML escaping of & undone. Keycloak's form is id="kc-form-login"; any other
-# POST form is the fallback for providers with a different theme.
+# form_action: the action URL of the provider's form in $BODY, with the HTML
+# escaping of & undone and a relative action resolved against the page it came
+# from. Keycloak's login form is id="kc-form-login"; any other POST form (its
+# logout confirmation) is the fallback.
 form_action() {
-    local html form
+    local html form action
     html="$(tr '\n\r' '  ' <"$BODY")"
     form="$(printf '%s' "$html" | grep -oE '<form[^>]*id="kc-form-login"[^>]*>' | head -n 1 || true)"
     if [ -z "$form" ]; then
         form="$(printf '%s' "$html" | grep -oiE '<form[^>]*method="post"[^>]*>' | head -n 1 || true)"
     fi
-    printf '%s' "$form" | sed -n 's/.*action="\([^"]*\)".*/\1/p' | sed 's/&amp;/\&/g'
+    action="$(printf '%s' "$form" | sed -n 's/.*action="\([^"]*\)".*/\1/p' | sed 's/&amp;/\&/g')"
+    case "$action" in
+    /*) printf '%s%s' "$(printf '%s' "$FINAL_URL" | sed -n 's|^\([a-zA-Z][a-zA-Z0-9+.-]*://[^/]*\).*|\1|p')" "$action" ;;
+    *) printf '%s' "$action" ;;
+    esac
+}
+
+# hidden_value <name>: the value of a hidden input of the provider's form in $BODY.
+hidden_value() {
+    tr '\n\r' '  ' <"$BODY" | grep -oE "<input[^>]*name=\"$1\"[^>]*>" | head -n 1 |
+        sed -n 's/.*value="\([^"]*\)".*/\1/p' | sed 's/&amp;/\&/g'
 }
 
 # Cookie jar lines are tab separated: domain, subdomains, path, secure,
@@ -174,7 +185,7 @@ if [ -n "$LOGOUT_URL" ]; then
     browse "$LOGOUT_URL"
     ACTION="$(form_action)"
     if [ -n "$ACTION" ]; then
-        browse --data-urlencode "confirmLogout=Logout" --data-urlencode "session_code=" "$ACTION"
+        browse --data-urlencode "confirmLogout=Logout" --data-urlencode "session_code=$(hidden_value session_code)" "$ACTION"
     fi
     check "the provider logout lands back on /login" final_url_is "${BASE_URL}/login"
 fi

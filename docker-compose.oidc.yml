@@ -14,8 +14,9 @@
 
 services:
   keycloak:
-    # Exact tag on purpose; bump it deliberately.
-    image: quay.io/keycloak/keycloak:26.4.0
+    # Exact tag on purpose; bump it deliberately. KEYCLOAK_IMAGE only exists for
+    # networks where quay.io is not reachable (point it at a mirror of the same tag).
+    image: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.4.0}
     command: ["start-dev", "--import-realm"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin # local development only
