@@ -1,5 +1,5 @@
 import { vi } from 'vitest'
-import type { AppConfig, Note, User } from '../api/types'
+import type { AppConfig, AuthConfig, IdentityPlatformConfig, Note, User } from '../api/types'
 
 export interface MockRequest {
   method: string
@@ -80,6 +80,20 @@ export function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     ...overrides,
   }
 }
+
+export const oidcAuth = (display_name = 'Acme SSO'): AuthConfig => ({ provider: 'oidc', display_name })
+
+export const identityPlatformConfig: IdentityPlatformConfig = {
+  api_key: 'public-key',
+  auth_domain: 'p.firebaseapp.com',
+  project_id: 'p',
+  sign_in_methods: ['password'],
+}
+
+export const identityPlatformAuth = (overrides: Partial<IdentityPlatformConfig> = {}): AuthConfig => ({
+  provider: 'identity-platform',
+  identity_platform: { ...identityPlatformConfig, ...overrides },
+})
 
 export function makeNote(overrides: Partial<Note> = {}): Note {
   return {

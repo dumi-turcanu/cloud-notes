@@ -1,19 +1,24 @@
 import { useState, type FormEvent } from 'react'
 import { Link, Navigate, useNavigate } from 'react-router'
 import { isApiError } from '../api/client'
+import { isAuthFlowError } from '../auth/errors'
 import { ErrorBanner } from '../components/ErrorBanner'
 import { TextField } from '../components/TextField'
 import { primaryButton } from '../components/ui'
 import { useAppConfig } from '../context/useAppConfig'
 import { useAuth } from '../context/useAuth'
+import { signUpPassword } from '../auth/identityPlatform'
+import { authConfigOf } from '../lib/authConfig'
 import { describeError, runeLength } from '../lib/errors'
 import { AuthShell } from './AuthShell'
 
 type FieldErrors = Partial<Record<'email' | 'password' | 'display_name' | 'invite_code', string>>
 
 export function RegisterPage() {
-  const { status, register } = useAuth()
-  const { signup_mode } = useAppConfig()
+  const { status, register, loginWithIdToken } = useAuth()
+  const config = useAppConfig()
+  const { signup_mode } = config
+  const auth = authConfigOf(config)
   const navigate = useNavigate()
 
   const [email, setEmail] = useState('')
@@ -25,7 +30,13 @@ export function RegisterPage() {
   const [busy, setBusy] = useState(false)
 
   if (status === 'authenticated') return <Navigate to="/" replace />
-  if (signup_mode === 'disabled') return <Navigate to="/login" replace />
+  // Single sign-on: accounts are created on the provider's hosted page.
+  if (auth.provider === 'oidc') return <Navigate to="/login" replace />
+  const idp = auth.provider === 'identity-platform' ? auth.identity_platform : undefined
+  // signup_mode only governs local accounts; Identity Platform decides in its own console.
+  if (auth.provider === 'identity-platform' ? !idp?.sign_in_methods.includes('password') : signup_mode === 'disabled') {
+    return <Navigate to="/login" replace />
+  }
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault()
@@ -37,18 +48,22 @@ export function RegisterPage() {
     if (length < 12) next.password = 'Password must be at least 12 characters.'
     else if (length > 128) next.password = 'Password must be at most 128 characters.'
     else if (password === trimmedEmail) next.password = 'Password must not be the same as your email.'
-    if (signup_mode === 'invite' && !inviteCode.trim()) next.invite_code = 'An invite code is required.'
+    if (!idp && signup_mode === 'invite' && !inviteCode.trim()) next.invite_code = 'An invite code is required.'
     setErrors(next)
     if (Object.keys(next).length > 0) return
 
     setBusy(true)
     try {
-      await register({
-        email: trimmedEmail,
-        password,
-        ...(displayName.trim() ? { display_name: displayName.trim() } : {}),
-        ...(signup_mode === 'invite' ? { invite_code: inviteCode.trim() } : {}),
-      })
+      if (idp) {
+        await loginWithIdToken(await signUpPassword(idp, trimmedEmail, password))
+      } else {
+        await register({
+          email: trimmedEmail,
+          password,
+          ...(displayName.trim() ? { display_name: displayName.trim() } : {}),
+          ...(signup_mode === 'invite' ? { invite_code: inviteCode.trim() } : {}),
+        })
+      }
       void navigate('/', { replace: true })
     } catch (err) {
       if (isApiError(err) && err.code === 'validation_failed') {
@@ -59,8 +74,12 @@ export function RegisterPage() {
           invite_code: err.fields.invite_code,
         })
         if (Object.keys(err.fields).length === 0) setFormError(err.message)
-      } else if (isApiError(err) && err.code === 'email_taken') {
+      } else if ((isApiError(err) && err.code === 'email_taken') || (isAuthFlowError(err) && err.code === 'email_taken')) {
         setErrors({ email: 'An account with this email already exists.' })
+      } else if (isAuthFlowError(err) && err.code === 'weak_password') {
+        setErrors({ password: err.message })
+      } else if (isAuthFlowError(err) && err.code === 'invalid_email') {
+        setErrors({ email: err.message })
       } else if (isApiError(err) && err.code === 'invalid_invite_code') {
         setErrors({ invite_code: 'This invite code is not valid.' })
       } else {
@@ -83,15 +102,17 @@ export function RegisterPage() {
           error={errors.email}
           disabled={busy}
         />
-        <TextField
-          label="Display name (optional)"
-          autoComplete="nickname"
-          value={displayName}
-          onChange={setDisplayName}
-          error={errors.display_name}
-          maxLength={100}
-          disabled={busy}
-        />
+        {!idp && (
+          <TextField
+            label="Display name (optional)"
+            autoComplete="nickname"
+            value={displayName}
+            onChange={setDisplayName}
+            error={errors.display_name}
+            maxLength={100}
+            disabled={busy}
+          />
+        )}
         <TextField
           label="Password"
           type="password"
@@ -102,7 +123,7 @@ export function RegisterPage() {
           error={errors.password}
           disabled={busy}
         />
-        {signup_mode === 'invite' && (
+        {!idp && signup_mode === 'invite' && (
           <TextField
             label="Invite code"
             autoComplete="off"

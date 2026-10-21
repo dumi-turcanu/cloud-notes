@@ -5,6 +5,16 @@ import type { LoginInput, RegisterInput, User } from '../api/types'
 import { notesKey, onUnauthorized } from '../lib/queryClient'
 import { AuthContext, type AuthContextValue, type AuthStatus } from './authContext'
 
+/** Only ever navigate to http(s) URLs: the value comes from an API response. */
+function isHttpUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value)
+    return protocol === 'https:' || protocol === 'http:'
+  } catch {
+    return false
+  }
+}
+
 interface AuthState {
   status: AuthStatus
   user: User | null
@@ -49,19 +59,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return user
   }, [])
 
+  const loginWithIdToken = useCallback(async (idToken: string) => {
+    const user = await authApi.createSession(idToken)
+    setState({ status: 'authenticated', user })
+    return user
+  }, [])
+
   const logout = useCallback(async () => {
+    let logoutUrl: string | undefined
     try {
-      await authApi.logout()
+      const result = await authApi.logout()
+      logoutUrl = result?.logout_url
     } catch (err) {
       console.warn('logout request failed', err instanceof Error ? err.message : err)
-    } finally {
-      setAnonymous()
     }
+    setAnonymous()
+    // With single sign-on the provider has a session of its own: end it too.
+    if (logoutUrl && isHttpUrl(logoutUrl)) window.location.assign(logoutUrl)
   }, [setAnonymous])
 
   const value = useMemo<AuthContextValue>(
-    () => ({ ...state, login, register, logout }),
-    [state, login, register, logout],
+    () => ({ ...state, login, register, loginWithIdToken, logout }),
+    [state, login, register, loginWithIdToken, logout],
   )
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

@@ -8,6 +8,8 @@ export interface AuthContextValue {
   user: User | null
   login: (input: LoginInput) => Promise<User>
   register: (input: RegisterInput) => Promise<User>
+  /** Signs in with an Identity Platform ID token (AUTH_PROVIDER=identity-platform). */
+  loginWithIdToken: (idToken: string) => Promise<User>
   logout: () => Promise<void>
 }
 
