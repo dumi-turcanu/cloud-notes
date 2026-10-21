@@ -384,3 +384,26 @@ func TestIdentityPlatformValidation(t *testing.T) {
 		})
 	}
 }
+
+// The values docker-compose.oidc.yml gives the backend (Keycloak in the local
+// stack) must pass validation: plain http is only acceptable because the
+// stack runs with SESSION_COOKIE_SECURE=false.
+func TestOIDCLocalKeycloakStackIsValid(t *testing.T) {
+	e := baseEnv()
+	for k, v := range map[string]string{
+		"AUTH_PROVIDER": "oidc", "SESSION_COOKIE_SECURE": "false", "PUBLIC_APP_URL": "http://localhost:3000",
+		"OIDC_ISSUER_URL":    "http://localhost:8081/realms/cloud-notes",
+		"OIDC_DISCOVERY_URL": "http://keycloak:8080/realms/cloud-notes",
+		"OIDC_CLIENT_ID":     "cloud-notes", "OIDC_CLIENT_SECRET": "cloud-notes-local-only-secret",
+		"OIDC_PROVIDER_NAME": "Keycloak",
+	} {
+		e[k] = v
+	}
+	c, err := Load(env(e), noFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.OIDCRedirectURL != "http://localhost:3000/api/auth/oidc/callback" || c.OIDCPostLogoutRedirectURL != "http://localhost:3000/login" {
+		t.Errorf("redirect URLs must match the Keycloak realm: %q %q", c.OIDCRedirectURL, c.OIDCPostLogoutRedirectURL)
+	}
+}

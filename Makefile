@@ -7,10 +7,11 @@ BASE_URL   ?= http://localhost:3000
 
 HADOLINT   := hadolint/hadolint:latest-alpine
 SHELLCHECK := koalaman/shellcheck:stable
-SHELL_SRC  := scripts/smoke-test.sh $(wildcard frontend/nginx/docker-entrypoint.d/*.sh)
+SHELL_SRC  := scripts/smoke-test.sh scripts/smoke-test-oidc.sh $(wildcard frontend/nginx/docker-entrypoint.d/*.sh)
+COMPOSE_OIDC := docker compose -f docker-compose.yml -f docker-compose.oidc.yml
 
 .DEFAULT_GOAL := help
-.PHONY: help up down clean logs ps smoke test test-integration vuln lint build demo-user
+.PHONY: help up up-oidc down clean logs ps smoke smoke-oidc test test-integration vuln lint build demo-user
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -18,11 +19,14 @@ help: ## Show this help
 up: ## Build and start the local stack (http://localhost:3000)
 	VERSION=$(VERSION) COMMIT=$(SHA) docker compose up -d --build --wait
 
+up-oidc: ## Like `up`, plus Keycloak as OIDC provider (sign in as student@example.com)
+	VERSION=$(VERSION) COMMIT=$(SHA) $(COMPOSE_OIDC) up -d --build --wait
+
 down: ## Stop the stack (keeps the database volume)
-	docker compose down
+	docker compose down --remove-orphans
 
 clean: ## Stop the stack and delete the database volume
-	docker compose down -v
+	docker compose down -v --remove-orphans
 
 logs: ## Follow the logs of all services
 	docker compose logs -f
@@ -32,6 +36,9 @@ ps: ## Show service status
 
 smoke: ## Run the end-to-end smoke test against BASE_URL
 	BASE_URL=$(BASE_URL) ./scripts/smoke-test.sh
+
+smoke-oidc: ## Run the OIDC login + notes smoke test against BASE_URL (needs `make up-oidc`)
+	BASE_URL=$(BASE_URL) ./scripts/smoke-test-oidc.sh
 
 test: ## Backend and frontend unit tests
 	$(MAKE) -C backend test
