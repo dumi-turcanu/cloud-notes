@@ -1,0 +1,65 @@
+# Local OIDC stack: the normal stack plus Keycloak as the identity provider, so
+# the AUTH_PROVIDER=oidc flow (the same one used with AWS Cognito and Azure
+# Entra External ID) can be tried without a cloud account.
+#
+#   make up-oidc        # http://localhost:3000, sign in as student@example.com
+#   make smoke-oidc     # scripted login + notes round trip
+#
+# Run it through compose's file merge, never on its own:
+#   docker compose -f docker-compose.yml -f docker-compose.oidc.yml up -d --build
+#
+# Every credential below is a THROW-AWAY, LOCAL-DEVELOPMENT-ONLY value (the
+# realm in deploy/keycloak/ uses the same client secret). Never reuse them
+# anywhere that is reachable from a network.
+
+services:
+  keycloak:
+    # Exact tag on purpose; bump it deliberately. KEYCLOAK_IMAGE only exists for
+    # networks where quay.io is not reachable (point it at a mirror of the same tag).
+    image: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.4.0}
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin # local development only
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin # local development only
+      # Browsers reach Keycloak at http://localhost:8081 ...
+      KC_HOSTNAME: http://localhost:8081
+      # ... while the backend container talks to http://keycloak:8080: with this
+      # switch the token and JWKS URLs in the discovery document follow the
+      # host name the request used, and the browser-facing ones do not.
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./deploy/keycloak/realm-cloud-notes.json:/opt/keycloak/data/import/realm-cloud-notes.json:ro
+    ports:
+      - "127.0.0.1:8081:8080"
+    healthcheck:
+      # The image has no curl; /health/ready is served on the management port.
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"status": "UP"' <&3
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  backend:
+    environment:
+      AUTH_PROVIDER: oidc
+      # The issuer is what the browser (and the ID tokens) see ...
+      OIDC_ISSUER_URL: http://localhost:8081/realms/cloud-notes
+      # ... discovery is fetched over the compose network.
+      OIDC_DISCOVERY_URL: http://keycloak:8080/realms/cloud-notes
+      OIDC_CLIENT_ID: cloud-notes
+      OIDC_CLIENT_SECRET: cloud-notes-local-only-secret # local development only
+      OIDC_PROVIDER_NAME: Keycloak
+      PUBLIC_APP_URL: http://localhost:3000
+    depends_on:
+      keycloak:
+        condition: service_healthy

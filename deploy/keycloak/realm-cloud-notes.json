@@ -1,0 +1,61 @@
+{
+  "realm": "cloud-notes",
+  "displayName": "Cloud Notes (LOCAL DEVELOPMENT ONLY)",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "registrationEmailAsUsername": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "verifyEmail": false,
+  "bruteForceProtected": false,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "clients": [
+    {
+      "clientId": "cloud-notes",
+      "name": "Cloud Notes",
+      "description": "Confidential OIDC client used by the Cloud Notes API (backend-for-frontend). LOCAL DEVELOPMENT ONLY.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "cloud-notes-local-only-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "rootUrl": "http://localhost:3000",
+      "baseUrl": "/",
+      "redirectUris": ["http://localhost:3000/api/auth/oidc/callback"],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:3000/login",
+        "backchannel.logout.session.required": "false"
+      },
+      "defaultClientScopes": ["web-origins", "profile", "email", "roles"],
+      "optionalClientScopes": []
+    }
+  ],
+  "users": [
+    {
+      "username": "student@example.com",
+      "email": "student@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Student",
+      "lastName": "Example",
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "student-local-only-password",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

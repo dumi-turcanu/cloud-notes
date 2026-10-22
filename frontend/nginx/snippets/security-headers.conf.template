@@ -1,0 +1,12 @@
+# Rendered by docker-entrypoint.d/05-validate-env.sh into
+# /etc/nginx/conf.d/security-headers.inc, which every location that serves HTML
+# or assets includes: add_header in a location replaces (does not extend)
+# headers defined at server level. The @...@ markers are the only variable
+# parts; with FRONTEND_AUTH_PROFILE=none they are empty / the strict default.
+add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'@SCRIPT_SRC_EXTRA@; connect-src 'self'@CONNECT_SRC_EXTRA@; frame-ancestors 'none'; base-uri 'self'; form-action 'self'@FRAME_SRC_DIRECTIVE@" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+add_header Cross-Origin-Opener-Policy "@COOP@" always;
+# Browsers ignore HSTS over plain HTTP, so it is safe to send unconditionally.
+add_header Strict-Transport-Security "max-age=31536000" always;

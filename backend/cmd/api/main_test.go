@@ -201,6 +201,24 @@ func TestCreateUserUsageErrors(t *testing.T) {
 	}
 }
 
+func TestCreateUserRefusedWithExternalProvider(t *testing.T) {
+	for _, provider := range []string{"oidc", "identity-platform", " OIDC ", "ldap"} {
+		t.Run(provider, func(t *testing.T) {
+			f := &fakeCreator{}
+			code, _, errs := runCreate(t, []string{"--email", "a@example.com"},
+				map[string]string{"AUTH_PROVIDER": provider, "NEW_USER_PASSWORD": "correct horse battery"}, "", f)
+			if code != exitError || !strings.Contains(errs, "AUTH_PROVIDER") || len(f.calls) != 0 {
+				t.Errorf("exit %d, stderr %q, calls %v", code, errs, f.calls)
+			}
+		})
+	}
+	f := &fakeCreator{}
+	if code, _, errs := runCreate(t, []string{"--email", "a@example.com"},
+		map[string]string{"AUTH_PROVIDER": "local", "NEW_USER_PASSWORD": "correct horse battery"}, "", f); code != exitOK {
+		t.Errorf("AUTH_PROVIDER=local must still work: exit %d: %s", code, errs)
+	}
+}
+
 func TestCreateUserBackendFailure(t *testing.T) {
 	f := &fakeCreator{err: errors.New("db down")}
 	code, _, errs := runCreate(t, []string{"--email", "a@example.com"}, map[string]string{"NEW_USER_PASSWORD": "correct horse battery"}, "", f)

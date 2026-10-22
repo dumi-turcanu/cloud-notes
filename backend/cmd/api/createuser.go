@@ -46,6 +46,14 @@ func createUser(ctx context.Context, args []string, getenv func(string) string,
 		return exitUsage
 	}
 
+	// Passwords belong to the identity provider in the external modes. An
+	// unrecognised value is refused too: only an explicit local deployment
+	// may create password users.
+	if provider := strings.ToLower(strings.TrimSpace(getenv("AUTH_PROVIDER"))); provider != "" && provider != config.AuthLocal {
+		fmt.Fprintf(stderr, "create-user: not available when AUTH_PROVIDER=%s: users sign in through the identity provider and are created on first login\n", provider)
+		return exitError
+	}
+
 	var password string
 	if *fromStdin {
 		line, err := bufio.NewReader(io.LimitReader(stdin, maxPasswordInput)).ReadString('\n')

@@ -1,16 +1,16 @@
 # Architecture
 
-Cloud Notes is deliberately small: two stateless containers and one PostgreSQL database. It has
-no cloud SDKs and no cloud identity service, so the same images run on every cloud. Everything
-that differs between environments (database, secrets, URLs, feature flags) is configuration —
-see [configuration.md](configuration.md).
+Cloud Notes is deliberately small: two stateless containers and one PostgreSQL database. The
+backend has no cloud SDKs, so the same images run on every cloud. Everything that differs between
+environments (database, secrets, URLs, feature flags, **which identity service signs users in**) is
+configuration — see [configuration.md](configuration.md) and [authentication.md](authentication.md).
 
 ## Components
 
 | Component | Image | Responsibility |
 | --- | --- | --- |
 | **Frontend** | `cloud-notes-frontend` (nginx, non-root, port `8080`) | Serves the React single-page application (static files) and reverse-proxies `/api/*` to the backend, so the browser sees **one origin**. Adds security headers, caches `/assets/*`, exposes `/healthz`. |
-| **Backend** | `cloud-notes-backend` (Go, distroless, binary `cloud-notes-api`) | JSON API under `/api`: sign-in with e-mail + password, server-side sessions, notes (create, edit, trash, restore, optional public share links). Runs migrations, serves `/healthz` + `/readyz` on `8080` and Prometheus metrics on a separate listener (`9090`). |
+| **Backend** | `cloud-notes-backend` (Go, distroless, binary `cloud-notes-api`) | JSON API under `/api`: sign-in (e-mail + password, or an external identity provider through OpenID Connect or GCP Identity Platform; see `AUTH_PROVIDER`), server-side sessions, notes (create, edit, trash, restore, optional public share links). Runs migrations, serves `/healthz` + `/readyz` on `8080` and Prometheus metrics on a separate listener (`9090`). |
 | **PostgreSQL** | managed service, version 15+ | The only state: users, sessions, notes. No extensions required. |
 | **Edge** | CDN / global load balancer / WAF | TLS termination, caching of static assets, rate limiting of `/api/auth/*`, origin lock-down. Provided by the hosting platform; not part of this repository. |
 
@@ -20,9 +20,16 @@ Design decisions that shape the deployment:
   `/api/*` must be reachable on the same host name. Either use the frontend container's built-in
   proxy (`API_UPSTREAM`) or route `/api/*` to the backend at your load balancer.
 - **Server-side sessions.** The cookie holds a random token; PostgreSQL stores only its SHA-256.
-  Any replica can serve any request, and a session can be revoked by deleting a row. No JWTs.
-- **Sign-up is closed by default** (`AUTH_SIGNUP_MODE=disabled`). The first user is created by a
-  one-off job: `cloud-notes-api create-user`.
+  Any replica can serve any request, and a session can be revoked by deleting a row. No JWTs are
+  handed to the browser; with an external provider the backend verifies the provider's ID token once
+  and then issues the same session cookie.
+- **One image, three sign-in modes.** `AUTH_PROVIDER` selects `local` (passwords in the database,
+  default), `oidc` (backend-for-frontend OpenID Connect client: AWS Cognito, Azure Entra External ID,
+  Keycloak) or `identity-platform` (GCP: the SPA lazy-loads the Firebase Auth SDK and posts the ID
+  token to the backend). See [authentication.md](authentication.md).
+- **Sign-up is closed by default** (`AUTH_SIGNUP_MODE=disabled`, `local` mode). The first user is
+  created by a one-off job: `cloud-notes-api create-user`. With an external provider, accounts are
+  created on first sign-in and the provider decides who may sign up.
 - **Stateless containers.** Everything is in PostgreSQL, so both images can be scaled horizontally
   and replaced at will. The only per-replica state is the in-memory login rate limiter
   (best effort, see [security.md](security.md)).
@@ -50,6 +57,9 @@ flowchart LR
 5. Metrics are **not** served on the public listener; the monitoring system scrapes port `9090`.
 
 ## Login sequence
+
+This is the `local` mode. The `oidc` and `identity-platform` sequences are in
+[authentication.md](authentication.md); they all end with the same session cookie.
 
 ```mermaid
 sequenceDiagram
@@ -89,17 +99,25 @@ After a 401 on any protected call the SPA returns to the sign-in page.
 erDiagram
     users ||--o{ sessions : "has"
     users ||--o{ notes : "owns"
+    users ||--o{ user_identities : "signs in with"
 
     users {
         uuid id PK
         varchar email "unique, lower-case"
         varchar display_name "nullable"
-        text password_hash "Argon2id PHC string"
+        text password_hash "Argon2id PHC string; NULL for external-provider users"
         int failed_login_count
         timestamptz locked_until "nullable"
         timestamptz last_login_at "nullable"
         timestamptz created_at
         timestamptz updated_at
+    }
+    user_identities {
+        text issuer PK "OIDC / Identity Platform token iss"
+        text subject PK "token sub"
+        uuid user_id FK
+        timestamptz created_at
+        timestamptz last_login_at "nullable"
     }
     sessions {
         bytea token_hash PK "SHA-256 of the cookie token"
@@ -123,7 +141,8 @@ erDiagram
     }
 ```
 
-The schema is created by a single embedded migration (`000001_init`) using core PostgreSQL features
+The schema is created by two embedded migrations (`000001_init`, and `000002_external_identities`,
+which makes `password_hash` nullable and adds `user_identities`) using core PostgreSQL features
 only (`gen_random_uuid()` is built in since PostgreSQL 13), which is why no extensions are needed.
 Deleting a note only sets `deleted_at` (trash); there is no automatic purge. Deleting a user
 cascades to sessions and notes, but the application has no user-deletion feature.

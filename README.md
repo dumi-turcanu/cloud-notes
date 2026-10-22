@@ -1,19 +1,23 @@
 # Cloud Notes
 
 A secure, cloud-agnostic note-taking application: a React single-page app, a Go REST API and
-PostgreSQL. Users sign in with e-mail and password, write notes, move them to the trash and
-restore them, and can optionally publish a note through an unguessable share link.
+PostgreSQL. Users sign in (with e-mail and password, or through the identity service of their
+cloud), write notes, move them to the trash and restore them, and can optionally publish a note
+through an unguessable share link.
 
 The application is delivered as **two container images** (`cloud-notes-frontend`,
-`cloud-notes-backend`) and needs **PostgreSQL 15+** as its only stateful dependency. It contains
-no cloud SDKs and depends on no external identity provider, so the same images run unchanged on
-AWS, Google Cloud, Azure, any Kubernetes cluster or a single Docker host.
+`cloud-notes-backend`) and needs **PostgreSQL 15+** as its only stateful dependency. The backend
+contains no cloud SDKs and an environment variable (`AUTH_PROVIDER`) picks the sign-in method, so
+the same images run unchanged on AWS, Google Cloud, Azure, any Kubernetes cluster or a single Docker
+host.
 
 ## Features
 
-- E-mail + password sign-in with Argon2id hashing, server-side sessions and an `HttpOnly`,
-  `Secure`, `SameSite=Strict` cookie; account lockout and per-IP rate limiting
-- Sign-up modes: disabled (default), invite code, or open; `create-user` command for operators
+- Three sign-in modes selected by `AUTH_PROVIDER`: `local` (e-mail + password, Argon2id; the default),
+  `oidc` (AWS Cognito, Azure Entra External ID, Keycloak, … through OpenID Connect) and
+  `identity-platform` (GCP). All end in a server-side session and an `HttpOnly`, `Secure`,
+  `SameSite=Strict` cookie; account lockout and per-IP rate limiting
+- Local sign-up modes: disabled (default), invite code, or open; `create-user` command for operators
 - Notes: create, edit, delete to trash, restore
 - Optional public, read-only share links (`FEATURE_PUBLIC_SHARING`)
 - Strict Content-Security-Policy, CSRF protection, no tokens in JavaScript
@@ -29,6 +33,8 @@ make up                      # build the images and start db + backend + fronten
 open http://localhost:3000   # or just browse to it: register an account, create a note
 make smoke                   # end-to-end smoke test against http://localhost:3000
 make down                    # stop (keeps data);  make clean  also deletes the database volume
+make up-oidc                 # same, plus Keycloak: single sign-on as student@example.com (see docs/authentication.md)
+make smoke-oidc              # end-to-end smoke test of that login
 ```
 
 The local stack runs with open sign-up, plain HTTP and **throw-away credentials that are for local
@@ -49,8 +55,8 @@ backend/                 Go API (module github.com/dumi-turcanu/cloud-notes/back
   internal/              config, database (+ embedded migrations), auth, handlers, observability, server
 frontend/                React SPA and the nginx container that serves it and proxies /api
   src/                   application code        nginx/   container configuration
-scripts/smoke-test.sh    end-to-end smoke test (bash + curl + jq)
-docker-compose.yml       local stack
+scripts/smoke-test.sh    end-to-end smoke test (bash + curl + jq); smoke-test-oidc.sh for the Keycloak login
+docker-compose.yml       local stack (docker-compose.oidc.yml adds Keycloak; realm in deploy/keycloak/)
 Makefile                 developer and CI commands
 docs/                    documentation (below)
 ```
@@ -62,6 +68,7 @@ docs/                    documentation (below)
 | [docs/architecture.md](docs/architecture.md) | Components, request flow, login sequence, data model, deployment topologies |
 | [docs/configuration.md](docs/configuration.md) | Every environment variable, subcommand, port and endpoint |
 | [docs/deployment-guide.md](docs/deployment-guide.md) | Running the images in production: networking, database, secrets, migrations, probes, per-platform settings |
+| [docs/authentication.md](docs/authentication.md) | The three sign-in modes, setup for AWS Cognito, Azure Entra External ID and GCP Identity Platform, security decisions, troubleshooting |
 | [docs/security.md](docs/security.md) | Authentication design, threat model, limitations, hardening checklist |
 | [docs/api/openapi.yaml](docs/api/openapi.yaml) | OpenAPI 3.1 description of the HTTP API |
 | [backend/README.md](backend/README.md) | Backend development, tests, image |
@@ -85,6 +92,7 @@ All of these run from the repository root (locally or in CI):
 
 | Command | What it does |
 | --- | --- |
+| `make up-oidc` / `make smoke-oidc` | Local stack with Keycloak as OIDC provider, and its smoke test |
 | `make lint` | gofmt + `go vet`, ESLint + TypeScript type check, hadolint on both Dockerfiles, shellcheck on the scripts |
 | `make test` | Backend unit tests (`go test -race ./...`) and frontend tests (`vitest`) |
 | `make test-integration` | Backend tests against a throw-away PostgreSQL container |

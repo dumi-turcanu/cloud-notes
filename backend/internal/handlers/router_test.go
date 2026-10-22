@@ -464,3 +464,126 @@ func TestLoginRateLimitedPerClientIP(t *testing.T) {
 		t.Errorf("other IP must not be limited: %d", rr.Code)
 	}
 }
+
+func TestPublicConfigAuthSection(t *testing.T) {
+	type authBody struct {
+		Auth struct {
+			Provider         string `json:"provider"`
+			DisplayName      string `json:"display_name"`
+			IdentityPlatform *struct {
+				APIKey        string   `json:"api_key"`
+				AuthDomain    string   `json:"auth_domain"`
+				ProjectID     string   `json:"project_id"`
+				TenantID      string   `json:"tenant_id"`
+				SignInMethods []string `json:"sign_in_methods"`
+			} `json:"identity_platform"`
+		} `json:"auth"`
+		SignupMode string `json:"signup_mode"`
+	}
+	tests := []struct {
+		name   string
+		mutate func(c *config.Config)
+		check  func(t *testing.T, b authBody)
+	}{
+		{"unset provider means local", func(c *config.Config) {}, func(t *testing.T, b authBody) {
+			if b.Auth.Provider != "local" || b.Auth.DisplayName != "" || b.Auth.IdentityPlatform != nil {
+				t.Errorf("%+v", b.Auth)
+			}
+		}},
+		{"local", func(c *config.Config) { c.AuthProvider = config.AuthLocal }, func(t *testing.T, b authBody) {
+			if b.Auth.Provider != "local" || b.SignupMode != "open" {
+				t.Errorf("%+v", b)
+			}
+		}},
+		{"oidc", func(c *config.Config) {
+			c.AuthProvider, c.OIDCProviderName = config.AuthOIDC, "Acme SSO"
+			c.OIDCClientSecret = "must-not-leak"
+		}, func(t *testing.T, b authBody) {
+			if b.Auth.Provider != "oidc" || b.Auth.DisplayName != "Acme SSO" || b.Auth.IdentityPlatform != nil {
+				t.Errorf("%+v", b.Auth)
+			}
+		}},
+		{"identity platform", func(c *config.Config) {
+			c.AuthProvider = config.AuthIdentityPlatform
+			c.IDPAPIKey, c.IDPAuthDomain, c.IDPProjectID = "key", "p.firebaseapp.com", "p"
+			c.IDPTenantID, c.IDPSignInMethods = "t-1", []string{"password", "google"}
+		}, func(t *testing.T, b authBody) {
+			ip := b.Auth.IdentityPlatform
+			if b.Auth.Provider != "identity-platform" || ip == nil || ip.APIKey != "key" || ip.AuthDomain != "p.firebaseapp.com" ||
+				ip.ProjectID != "p" || ip.TenantID != "t-1" || len(ip.SignInMethods) != 2 {
+				t.Errorf("%+v %+v", b.Auth, ip)
+			}
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, tc.mutate)
+			rr := (&client{e: e}).do("GET", "/api/config", "")
+			if rr.Code != 200 {
+				t.Fatalf("status %d", rr.Code)
+			}
+			if strings.Contains(rr.Body.String(), "must-not-leak") {
+				t.Error("config leaks the client secret")
+			}
+			tc.check(t, decode[authBody](t, rr))
+		})
+	}
+}
+
+func TestPasswordEndpointsAreNotMountedWithExternalProvider(t *testing.T) {
+	for _, provider := range []string{config.AuthOIDC, config.AuthIdentityPlatform} {
+		t.Run(provider, func(t *testing.T) {
+			e := newEnv(t, func(c *config.Config) { c.AuthProvider = provider })
+			c := &client{e: e}
+			for _, p := range []string{"/api/auth/register", "/api/auth/login"} {
+				wantError(t, c.do("POST", p, `{"email":"a@example.com","password":"a-very-good-password"}`), 404, "not_found")
+			}
+			// Session endpoints stay mounted.
+			if rr := c.do("POST", "/api/auth/logout", ""); rr.Code != 204 {
+				t.Errorf("logout: %d", rr.Code)
+			}
+			wantError(t, c.do("GET", "/api/auth/me", ""), 401, "unauthorized")
+		})
+	}
+}
+
+func TestOIDCEndpointsAreMountedOnlyInOIDCMode(t *testing.T) {
+	for _, provider := range []string{"", config.AuthLocal, config.AuthIdentityPlatform} {
+		e := newEnv(t, func(c *config.Config) { c.AuthProvider = provider })
+		for _, p := range []string{"/api/auth/oidc/login", "/api/auth/oidc/callback"} {
+			wantError(t, (&client{e: e}).do("GET", p, ""), 404, "not_found")
+		}
+	}
+
+	// The provider is unreachable (no issuer configured), so a login attempt
+	// ends on the SPA's login page; the point is that the route exists.
+	e := newEnv(t, func(c *config.Config) { c.AuthProvider = config.AuthOIDC })
+	c := &client{e: e}
+	rr := c.do("GET", "/api/auth/oidc/login?from=/trash", "")
+	if rr.Code != http.StatusFound || rr.Header().Get("Location") != "/login?error=oidc_failed" {
+		t.Errorf("login: %d %q", rr.Code, rr.Header().Get("Location"))
+	}
+	rr = c.do("GET", "/api/auth/oidc/callback?error=access_denied", "")
+	if rr.Code != http.StatusFound || rr.Header().Get("Location") != "/login?error=oidc_cancelled" {
+		t.Errorf("callback: %d %q", rr.Code, rr.Header().Get("Location"))
+	}
+	if rr.Header().Get("Cache-Control") != "no-store" {
+		t.Error("oidc redirects must not be cached")
+	}
+}
+
+func TestSessionEndpointIsMountedOnlyInIdentityPlatformMode(t *testing.T) {
+	for _, provider := range []string{"", config.AuthLocal, config.AuthOIDC} {
+		e := newEnv(t, func(c *config.Config) { c.AuthProvider = provider })
+		wantError(t, (&client{e: e}).do("POST", "/api/auth/session", `{"id_token":"x"}`), 404, "not_found")
+	}
+
+	e := newEnv(t, func(c *config.Config) {
+		c.AuthProvider, c.IDPProjectID, c.IDPSignInMethods = config.AuthIdentityPlatform, "p", []string{"password"}
+	})
+	c := &client{e: e}
+	// Mounted, and a token that is not a JWT is refused before any key fetch.
+	wantError(t, c.do("POST", "/api/auth/session", `{"id_token":"not-a-jwt"}`), 401, "invalid_token")
+	// Same CSRF protection as every other mutation.
+	wantError(t, c.do("POST", "/api/auth/session", `{"id_token":"x"}`, "Sec-Fetch-Site", "cross-site"), 403, "forbidden")
+}

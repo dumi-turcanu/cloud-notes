@@ -1,8 +1,9 @@
 #!/bin/sh
-# Validates API_UPSTREAM / API_UPSTREAM_HOST and writes the (already validated)
-# values into an nginx include. Runs before the base image's template step.
-# Writing a file instead of exporting variables keeps untrusted characters out
-# of the nginx configuration: the values are checked against strict patterns.
+# Validates API_UPSTREAM / API_UPSTREAM_HOST and FRONTEND_AUTH_PROFILE and
+# writes the (already validated) values into nginx includes. Runs before the
+# base image's template step. Writing a file instead of exporting variables
+# keeps untrusted characters out of the nginx configuration: the values are
+# checked against strict patterns.
 set -eu
 
 fail() {
@@ -29,3 +30,54 @@ map \$server_name \$api_upstream      { default "${upstream}"; }
 map \$server_name \$api_upstream_host { default "${upstream_host}"; }
 CONF
 echo "05-validate-env.sh: proxying /api/ to ${upstream} (Host: ${upstream_host})"
+
+# --- security headers ---------------------------------------------------------
+# FRONTEND_AUTH_PROFILE=none (default) keeps the strict 'self'-only policy.
+# identity-platform additionally allows what the Firebase Auth SDK needs:
+#   connect-src  the Identity Toolkit and Secure Token APIs
+#   frame-src    the project's auth domain (the SDK's helper iframe)
+#   script-src   apis.google.com, only when the Google pop-up is enabled, which
+#                also needs Cross-Origin-Opener-Policy same-origin-allow-popups
+profile="${FRONTEND_AUTH_PROFILE:-none}"
+script_extra=""
+connect_extra=""
+frame_directive=""
+coop="same-origin"
+case "$profile" in
+none) ;;
+identity-platform)
+    idp_domain="${IDP_AUTH_DOMAIN:-}"
+    [ -n "$idp_domain" ] || fail "IDP_AUTH_DOMAIN is required when FRONTEND_AUTH_PROFILE=identity-platform, e.g. my-project.firebaseapp.com"
+    # case patterns (unlike grep) see the whole value, newlines included.
+    case "$idp_domain" in
+    *[!A-Za-z0-9.-]* | .* | -* | *. | *-)
+        fail "IDP_AUTH_DOMAIN is malformed; expected a bare host name such as my-project.firebaseapp.com"
+        ;;
+    esac
+    idp_methods="${IDP_SIGN_IN_METHODS:-password}"
+    case "$idp_methods" in
+    password | google | password,google | google,password) ;;
+    *) fail "IDP_SIGN_IN_METHODS is malformed; expected password, google or password,google" ;;
+    esac
+    connect_extra=" https://identitytoolkit.googleapis.com https://securetoken.googleapis.com"
+    frame_directive="; frame-src https://${idp_domain}"
+    case ",${idp_methods}," in
+    *,google,*)
+        script_extra=" https://apis.google.com"
+        coop="same-origin-allow-popups"
+        ;;
+    esac
+    ;;
+*)
+    fail "FRONTEND_AUTH_PROFILE='${profile}' is invalid; expected none or identity-platform"
+    ;;
+esac
+
+# Every substituted value matched a strict pattern above, so none contains the
+# sed delimiter, '&' or a backslash.
+sed -e "s|@SCRIPT_SRC_EXTRA@|${script_extra}|" \
+    -e "s|@CONNECT_SRC_EXTRA@|${connect_extra}|" \
+    -e "s|@FRAME_SRC_DIRECTIVE@|${frame_directive}|" \
+    -e "s|@COOP@|${coop}|" \
+    /etc/nginx/snippets/security-headers.conf.template > /etc/nginx/conf.d/security-headers.inc
+echo "05-validate-env.sh: security headers rendered for auth profile '${profile}'"

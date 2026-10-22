@@ -29,6 +29,12 @@ type Deps struct {
 	DB      Pinger
 	Notes   NoteRepository
 	Auth    auth.Flow
+	// OIDC is optional; when nil and AUTH_PROVIDER=oidc it is built from the
+	// configuration. Tests inject one pointed at a fake provider.
+	OIDC *auth.OIDCClient
+	// IdentityPlatform is optional; when nil and AUTH_PROVIDER=identity-platform
+	// it is built from the configuration (keys are fetched lazily from Google).
+	IdentityPlatform *auth.IdentityPlatformVerifier
 	// Recorder is optional; it receives auth outcomes for metrics.
 	Recorder auth.Recorder
 	// Metrics is optional; when set, requests are counted per route pattern.
@@ -104,12 +110,26 @@ func newAPIHandler(d Deps) (http.Handler, error) {
 		now = time.Now
 	}
 	limiter := auth.NewRateLimiter(cfg.RateLimitPerMinute, now)
+	oidcClient := d.OIDC
+	if oidcClient == nil && cfg.AuthProvider == config.AuthOIDC {
+		oidcClient = auth.NewOIDCClient(auth.OIDCSettingsFromConfig(cfg))
+	}
+	var idpVerifier *auth.IdentityPlatformVerifier
+	if cfg.AuthProvider == config.AuthIdentityPlatform {
+		idpVerifier = d.IdentityPlatform
+		if idpVerifier == nil {
+			idpVerifier = auth.NewIdentityPlatformVerifier(auth.IdentityPlatformSettingsFromConfig(cfg))
+		}
+	}
 	authH := auth.NewHandlers(d.Auth, auth.HandlerConfig{
 		SecureCookie: cfg.SessionCookieSecure,
 		ProxyHops:    cfg.TrustedProxyHops,
 		Limiter:      limiter,
 		Recorder:     d.Recorder,
 		Now:          now,
+		OIDC:         oidcClient,
+
+		IdentityPlatform: idpVerifier,
 	})
 	require := auth.RequireSession(d.Auth, cfg.SessionCookieSecure)
 	notes := NewNoteHandler(d.Notes, cfg.PublicAppURL)
@@ -122,8 +142,19 @@ func newAPIHandler(d Deps) (http.Handler, error) {
 
 	api.Route("/auth", func(r chi.Router) {
 		r.Use(httpx.NoStore)
-		r.Post("/register", authH.Register)
-		r.Post("/login", authH.Login)
+		// With an external provider the identity service owns credentials, so
+		// the password endpoints are not mounted and fall through to 404.
+		if !externalAuth(cfg) {
+			r.Post("/register", authH.Register)
+			r.Post("/login", authH.Login)
+		}
+		if idpVerifier != nil {
+			r.Post("/session", authH.CreateSession)
+		}
+		if oidcClient != nil {
+			r.Get("/oidc/login", authH.OIDCLogin)
+			r.Get("/oidc/callback", authH.OIDCCallback)
+		}
 		r.Post("/logout", authH.Logout)
 		r.With(require).Get("/me", authH.Me)
 	})
@@ -160,16 +191,51 @@ func routeMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteError(w, http.StatusMethodNotAllowed, httpx.CodeMethodNotAllowed, "method not allowed")
 }
 
+// externalAuth reports whether credentials are handled by an external identity
+// provider. An unset provider (tests building a Config by hand) means local.
+func externalAuth(cfg config.Config) bool {
+	return cfg.AuthProvider == config.AuthOIDC || cfg.AuthProvider == config.AuthIdentityPlatform
+}
+
 func publicConfig(cfg config.Config, version string) http.HandlerFunc {
 	type features struct {
 		PublicSharing bool `json:"public_sharing"`
 	}
+	// identityPlatform is the Firebase web configuration; the API key is
+	// public by design.
+	type identityPlatform struct {
+		APIKey        string   `json:"api_key"`
+		AuthDomain    string   `json:"auth_domain"`
+		ProjectID     string   `json:"project_id"`
+		TenantID      string   `json:"tenant_id,omitempty"`
+		SignInMethods []string `json:"sign_in_methods"`
+	}
+	type authInfo struct {
+		Provider         string            `json:"provider"`
+		DisplayName      string            `json:"display_name,omitempty"`
+		IdentityPlatform *identityPlatform `json:"identity_platform,omitempty"`
+	}
 	type body struct {
 		SignupMode string   `json:"signup_mode"`
 		Features   features `json:"features"`
+		Auth       authInfo `json:"auth"`
 		Version    string   `json:"version"`
 	}
-	resp := body{SignupMode: cfg.SignupMode, Features: features{PublicSharing: cfg.PublicSharing}, Version: version}
+	resp := body{
+		SignupMode: cfg.SignupMode,
+		Features:   features{PublicSharing: cfg.PublicSharing},
+		Auth:       authInfo{Provider: config.AuthLocal},
+		Version:    version,
+	}
+	switch cfg.AuthProvider {
+	case config.AuthOIDC:
+		resp.Auth = authInfo{Provider: config.AuthOIDC, DisplayName: cfg.OIDCProviderName}
+	case config.AuthIdentityPlatform:
+		resp.Auth = authInfo{Provider: config.AuthIdentityPlatform, IdentityPlatform: &identityPlatform{
+			APIKey: cfg.IDPAPIKey, AuthDomain: cfg.IDPAuthDomain, ProjectID: cfg.IDPProjectID,
+			TenantID: cfg.IDPTenantID, SignInMethods: cfg.IDPSignInMethods,
+		}}
+	}
 	return func(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, resp)
 	}

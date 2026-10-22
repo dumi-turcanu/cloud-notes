@@ -16,7 +16,7 @@ Variable names are explained in [configuration.md](configuration.md); the design
 | 5 | PostgreSQL 15+ in private networking, TLS enforced, automated backups | It is the only stateful component and holds password hashes and sessions. |
 | 6 | Secrets injected at runtime from a secret manager | Nothing secret in Git, images, IaC variables or pipeline logs. |
 | 7 | Migrations run as a pre-deploy job | New versions must not receive traffic before the schema is ready. |
-| 8 | First user created by an automated one-off job | Sign-up stays closed. |
+| 8 | First user created by an automated one-off job (`AUTH_PROVIDER=local`); with a cloud identity service, sign-up restricted in the service | Sign-up stays closed. |
 | 9 | Health checks and graceful shutdown configured per platform | Zero-downtime rollouts. |
 | 10 | `TRUSTED_PROXY_HOPS` matches the number of proxies | Correct client IP for rate limiting and audit logs. |
 | 11 | Logs and metrics collected | Operating and alerting; see [Observability hooks](#observability-hooks). |
@@ -66,7 +66,8 @@ the frontend and backend cannot be reached directly.
   metrics scraper on `9090`).
 - The database accepts connections on `5432` from the backend, the migration job and the bootstrap
   job only. Place it in private subnets without a public address.
-- The backend needs outbound access to the database and nothing else. The frontend needs outbound
+- The backend needs outbound access to the database and, with `AUTH_PROVIDER=oidc` or
+  `identity-platform`, HTTPS to the identity provider and nothing else. The frontend needs outbound
   access to the backend and DNS.
 
 ## PostgreSQL
@@ -87,9 +88,11 @@ the frontend and backend cannot be reached directly.
 
 ## Secrets
 
-Three values are secret: the database password (`DB_PASSWORD` or the whole `DATABASE_URL`), the invite
-code (`AUTH_INVITE_CODE`, only in `invite` mode) and the password of the first user
-(`NEW_USER_PASSWORD`). Store them in your cloud's secret manager and inject them at runtime, either
+Up to four values are secret: the database password (`DB_PASSWORD` or the whole `DATABASE_URL`), the invite
+code (`AUTH_INVITE_CODE`, only in `invite` mode), the password of the first user
+(`NEW_USER_PASSWORD`, `local` mode) and the OIDC client secret (`OIDC_CLIENT_SECRET`, only with
+`AUTH_PROVIDER=oidc`; Cognito and Entra client secrets expire or can be rotated, so plan it). The
+Identity Platform Web API key is public by design and not a secret. Store the secret ones in your cloud's secret manager and inject them at runtime, either
 
 - as environment variables from the platform's secret integration, or
 - as files, with the matching `*_FILE` variable (for example `DB_PASSWORD_FILE=/run/secrets/db-password`).
@@ -111,7 +114,24 @@ The schema is embedded in the backend image. Two options:
 
 `migrate` is idempotent. On Kubernetes, run it as a Job (for example a Helm `pre-install,pre-upgrade` hook).
 
-## First-user bootstrap
+## User sign-in
+
+Choose the sign-in mode per environment with `AUTH_PROVIDER` (the same two images everywhere):
+
+| Platform | Service | Settings |
+| --- | --- | --- |
+| AWS | Amazon Cognito user pool | `AUTH_PROVIDER=oidc`, issuer `https://cognito-idp.<region>.amazonaws.com/<pool-id>`, `OIDC_LOGOUT_URL` |
+| Azure | Microsoft Entra External ID | `AUTH_PROVIDER=oidc`, issuer `https://<sub>.ciamlogin.com/<tenant-id>/v2.0` |
+| Google Cloud | Identity Platform | `AUTH_PROVIDER=identity-platform`, `IDP_*` on the backend, `FRONTEND_AUTH_PROFILE=identity-platform` and `IDP_AUTH_DOMAIN` on the frontend |
+
+Step-by-step setup, the exact variables and troubleshooting are in
+[authentication.md](authentication.md). Register `https://<app>/api/auth/oidc/callback` as the
+redirect URI at the provider, keep the public host name identical to `PUBLIC_APP_URL`, and note that
+the backend needs outbound HTTPS to the provider (discovery, token endpoint, keys), and to
+`www.googleapis.com` for Identity Platform. With an external provider the first-user bootstrap below
+does not apply: users are created on their first sign-in.
+
+## First-user bootstrap (`local` mode)
 
 With `AUTH_SIGNUP_MODE=disabled` nobody can register, so create the first user with a one-off job
 using the backend image, the same database settings and the password from your secret manager:
@@ -195,12 +215,15 @@ BASE_URL=https://notes.example.com SMOKE_EMAIL=ci-user@example.com SMOKE_PASSWOR
   ./scripts/smoke-test.sh
 ```
 
-Requires `bash`, `curl` and `jq`. The script checks the frontend health check, security and cache
+Requires `bash`, `curl` and `jq`. With `AUTH_PROVIDER=local` the script checks the frontend health check, security and cache
 headers, `/api/config`, sign-in with the session cookie, a full note life cycle (create, read, update,
 delete, restore), sharing if enabled, that cross-site writes are rejected, and sign-out. It exits non-zero on any
 failure. Without `SMOKE_EMAIL`/`SMOKE_PASSWORD` it registers a random user, which only works when
 `AUTH_SIGNUP_MODE=open` — use a dedicated test user in the cloud. Run it from a pipeline stage
-after the rollout, and fail the pipeline if it fails.
+after the rollout, and fail the pipeline if it fails. The password endpoints do not exist with
+`AUTH_PROVIDER=oidc` or `identity-platform`, so the script does not apply there: check
+`GET /api/config` (`auth.provider`), the redirect to the provider and a manual sign-in instead
+(`scripts/smoke-test-oidc.sh` automates the browser flow against the local Keycloak stack only).
 
 ## Service mapping
 
@@ -215,6 +238,7 @@ after the rollout, and fail the pipeline if it fails.
 | Container registry | Amazon ECR | Artifact Registry | Azure Container Registry |
 | Private connectivity to the edge origin | CloudFront VPC origins | Cloud Run internal ingress + load balancer | Front Door Premium Private Link |
 | Pod/task identity (no static keys) | IAM roles (IRSA, Pod Identity, task roles) | Service accounts, Workload Identity | Managed identities, Workload Identity |
+| User sign-in | Amazon Cognito (`AUTH_PROVIDER=oidc`) | Identity Platform (`AUTH_PROVIDER=identity-platform`) | Microsoft Entra External ID (`AUTH_PROVIDER=oidc`) |
 | Logs | CloudWatch Logs | Cloud Logging | Azure Monitor Log Analytics |
 | Metrics | CloudWatch / Amazon Managed Service for Prometheus | Cloud Monitoring / Managed Service for Prometheus | Azure Monitor / managed Prometheus |
 | One-off jobs (migrate, create-user) | ECS `RunTask` | Cloud Run jobs | Container Apps jobs; Kubernetes: Jobs / Helm hooks |

@@ -37,11 +37,14 @@ type Users struct {
 	mu            sync.Mutex
 	Clock         *Clock
 	byID          map[uuid.UUID]*models.UserAccount
+	identities    map[[2]string]uuid.UUID // (issuer, subject) -> user
 	HashUpdates   int
 	FailNextWrite error
 }
 
-func NewUsers(c *Clock) *Users { return &Users{Clock: c, byID: map[uuid.UUID]*models.UserAccount{}} }
+func NewUsers(c *Clock) *Users {
+	return &Users{Clock: c, byID: map[uuid.UUID]*models.UserAccount{}, identities: map[[2]string]uuid.UUID{}}
+}
 
 func (u *Users) Create(_ context.Context, email string, name *string, hash string) (*models.UserAccount, error) {
 	u.mu.Lock()
@@ -118,6 +121,49 @@ func (u *Users) UpdatePasswordHash(_ context.Context, id uuid.UUID, hash string)
 		u.HashUpdates++
 	}
 	return nil
+}
+
+// UpsertExternal mirrors the SQL semantics: lookup by (issuer, subject), no
+// linking by email, a taken email on refresh keeps the old one.
+func (u *Users) UpsertExternal(_ context.Context, id models.ExternalIdentity) (*models.User, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	var name *string
+	if id.DisplayName != "" {
+		name = &id.DisplayName
+	}
+	now := u.Clock.Now()
+	emailTaken := func(except uuid.UUID) bool {
+		for _, x := range u.byID {
+			if x.Email == id.Email && x.ID != except {
+				return true
+			}
+		}
+		return false
+	}
+	if uid, ok := u.identities[[2]string{id.Issuer, id.Subject}]; ok {
+		x := u.byID[uid]
+		if !emailTaken(uid) {
+			x.Email = id.Email
+		}
+		if name != nil {
+			x.DisplayName = name
+		}
+		x.LastLoginAt = &now
+		pub := x.User
+		return &pub, nil
+	}
+	if emailTaken(uuid.Nil) {
+		return nil, models.ErrAccountConflict
+	}
+	acct := &models.UserAccount{
+		User:        models.User{ID: uuid.New(), Email: id.Email, DisplayName: name, CreatedAt: now},
+		LastLoginAt: &now,
+	}
+	u.byID[acct.ID] = acct
+	u.identities[[2]string{id.Issuer, id.Subject}] = acct.ID
+	pub := acct.User
+	return &pub, nil
 }
 
 // SetHash overwrites a stored hash (to plant legacy-parameter hashes).

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dumi-turcanu/cloud-notes/backend/internal/auth/authtest"
 	"github.com/dumi-turcanu/cloud-notes/backend/internal/config"
@@ -357,5 +358,146 @@ func TestNormalizeEmail(t *testing.T) {
 		if _, ok := NormalizeEmail(in); ok {
 			t.Errorf("%q must be rejected", in)
 		}
+	}
+}
+
+func TestLoginExternalCreatesUserWithoutPassword(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	id := ExternalIdentity{Issuer: "https://idp.example.com", Subject: "sub-1", Email: "  Ext@Example.COM ", DisplayName: "  Eve  "}
+
+	iss, err := f.svc.LoginExternal(ctx, id, ClientMeta{IP: "1.2.3.4", UserAgent: "ua"})
+	if err != nil || iss.Token == "" {
+		t.Fatalf("login external: %v", err)
+	}
+	if iss.User.Email != "ext@example.com" || iss.User.DisplayName == nil || *iss.User.DisplayName != "Eve" {
+		t.Errorf("user not normalised: %+v", iss.User)
+	}
+	if got := iss.ExpiresAt.Sub(f.clock.Now()); got != 12*time.Hour {
+		t.Errorf("absolute lifetime = %v", got)
+	}
+	sess, err := f.svc.Authenticate(ctx, iss.Token)
+	if err != nil || sess.User.ID != iss.User.ID {
+		t.Errorf("session does not resolve to the user: %v", err)
+	}
+	if acct := f.users.Get(iss.User.ID); acct.PasswordHash != "" {
+		t.Errorf("external user must have no password hash, got %q", acct.PasswordHash)
+	}
+
+	again, err := f.svc.LoginExternal(ctx, id, ClientMeta{})
+	if err != nil || again.User.ID != iss.User.ID {
+		t.Errorf("same (issuer, subject) must map to the same user: %v", err)
+	}
+	if again.Token == iss.Token || f.sessions.Count() != 2 {
+		t.Error("each login must issue a new session")
+	}
+}
+
+func TestLoginExternalEmailHandling(t *testing.T) {
+	tests := []struct {
+		name  string
+		email string
+		want  error
+	}{
+		{"missing", "", ErrEmailClaimMissing},
+		{"blank", "   ", ErrEmailClaimMissing},
+		{"not an address", "not-an-email", ErrEmailClaimMissing},
+		{"display form is rejected", "Eve <eve@example.com>", ErrEmailClaimMissing},
+		{"too long", strings.Repeat("a", 250) + "@example.com", ErrEmailClaimMissing},
+		{"valid", "eve@example.com", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			_, err := f.svc.LoginExternal(context.Background(),
+				ExternalIdentity{Issuer: "i", Subject: "s", Email: tc.email}, ClientMeta{})
+			if !errors.Is(err, tc.want) {
+				t.Errorf("got %v want %v", err, tc.want)
+			}
+			if tc.want != nil && f.sessions.Count() != 0 {
+				t.Error("no session may be issued without a valid email")
+			}
+		})
+	}
+}
+
+func TestLoginExternalTruncatesDisplayName(t *testing.T) {
+	f := newFixture(t)
+	long := strings.Repeat("é", maxDisplayNameLen+20)
+	iss, err := f.svc.LoginExternal(context.Background(),
+		ExternalIdentity{Issuer: "i", Subject: "s", Email: "e@example.com", DisplayName: long}, ClientMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := utf8.RuneCountInString(*iss.User.DisplayName); got != maxDisplayNameLen {
+		t.Errorf("display name has %d runes, want %d", got, maxDisplayNameLen)
+	}
+}
+
+func TestLoginExternalNeverLinksByEmail(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	local := f.register(t, "victim@example.com")
+
+	_, err := f.svc.LoginExternal(ctx, ExternalIdentity{Issuer: "i", Subject: "attacker", Email: "victim@example.com"}, ClientMeta{})
+	if !errors.Is(err, models.ErrAccountConflict) {
+		t.Fatalf("got %v, want ErrAccountConflict", err)
+	}
+	if f.sessions.Count() != 1 {
+		t.Error("a conflicting identity must not get a session")
+	}
+
+	// Two providers using the same email stay two separate identities: the
+	// second one conflicts instead of inheriting the first one's notes.
+	if _, err := f.svc.LoginExternal(ctx, ExternalIdentity{Issuer: "a", Subject: "1", Email: "shared@example.com"}, ClientMeta{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.svc.LoginExternal(ctx, ExternalIdentity{Issuer: "b", Subject: "1", Email: "shared@example.com"}, ClientMeta{}); !errors.Is(err, models.ErrAccountConflict) {
+		t.Errorf("same email at another issuer: got %v", err)
+	}
+	if got, _ := f.users.GetByEmail(ctx, "victim@example.com"); got.ID != local.User.ID {
+		t.Error("local account was modified")
+	}
+}
+
+func TestLoginExternalRefreshesProfile(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	id := ExternalIdentity{Issuer: "i", Subject: "s", Email: "old@example.com", DisplayName: "Old"}
+	first, err := f.svc.LoginExternal(ctx, id, ClientMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id.Email, id.DisplayName = "new@example.com", "New"
+	second, err := f.svc.LoginExternal(ctx, id, ClientMeta{})
+	if err != nil || second.User.ID != first.User.ID || second.User.Email != "new@example.com" || *second.User.DisplayName != "New" {
+		t.Fatalf("profile not refreshed: %+v %v", second, err)
+	}
+
+	// A provider-side email that now belongs to another account is ignored.
+	f.register(t, "taken@example.com")
+	id.Email = "taken@example.com"
+	third, err := f.svc.LoginExternal(ctx, id, ClientMeta{})
+	if err != nil || third.User.ID != first.User.ID || third.User.Email != "new@example.com" {
+		t.Errorf("taken email must keep the old one: %+v %v", third, err)
+	}
+}
+
+func TestLocalLoginRejectsExternalUsers(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	if _, err := f.svc.LoginExternal(ctx, ExternalIdentity{Issuer: "i", Subject: "s", Email: "ext@example.com"}, ClientMeta{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pw := range []string{goodPassword, "", "dummy-password-for-timing-equalisation"} {
+		if _, err := f.svc.Login(ctx, "ext@example.com", pw, ClientMeta{}); !errors.Is(err, ErrInvalidCredentials) {
+			t.Errorf("login(%q) for a user without a password: got %v", pw, err)
+		}
+	}
+	// It is indistinguishable from an unknown user: no lockout state is kept.
+	acct, _ := f.users.GetByEmail(ctx, "ext@example.com")
+	if acct.FailedLoginCount != 0 || acct.LockedUntil != nil {
+		t.Errorf("external user accrued lockout state: %+v", acct)
 	}
 }

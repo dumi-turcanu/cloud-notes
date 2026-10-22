@@ -185,3 +185,225 @@ func TestNewUserPassword(t *testing.T) {
 		t.Errorf("got %q %v", pw, err)
 	}
 }
+
+func oidcEnv() map[string]string {
+	e := baseEnv()
+	e["AUTH_PROVIDER"] = "oidc"
+	e["PUBLIC_APP_URL"] = "https://notes.example.com/"
+	e["OIDC_ISSUER_URL"] = "https://idp.example.com/realm"
+	e["OIDC_CLIENT_ID"] = "cloud-notes"
+	e["OIDC_CLIENT_SECRET"] = "s3cret"
+	return e
+}
+
+func idpEnv() map[string]string {
+	e := baseEnv()
+	e["AUTH_PROVIDER"] = "identity-platform"
+	e["IDP_PROJECT_ID"] = "my-project"
+	e["IDP_API_KEY"] = "public-key"
+	e["IDP_AUTH_DOMAIN"] = "my-project.firebaseapp.com"
+	return e
+}
+
+func TestAuthProviderDefaultsToLocalAndIgnoresExternalSettings(t *testing.T) {
+	e := baseEnv()
+	e["OIDC_ISSUER_URL"] = "not a url"
+	e["IDP_AUTH_DOMAIN"] = "https://bad/"
+	c, err := Load(env(e), noFiles)
+	if err != nil || c.AuthProvider != AuthLocal {
+		t.Fatalf("got %q, %v", c.AuthProvider, err)
+	}
+	e["AUTH_PROVIDER"] = "ldap"
+	if _, err := Load(env(e), noFiles); err == nil || !strings.Contains(err.Error(), "AUTH_PROVIDER") {
+		t.Errorf("want AUTH_PROVIDER error, got %v", err)
+	}
+}
+
+func TestOIDCDefaults(t *testing.T) {
+	c, err := Load(env(oidcEnv()), noFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AuthProvider != AuthOIDC || c.OIDCIssuerURL != "https://idp.example.com/realm" ||
+		c.OIDCClientID != "cloud-notes" || c.OIDCClientSecret != "s3cret" {
+		t.Errorf("settings wrong: %+v", c)
+	}
+	if c.OIDCRedirectURL != "https://notes.example.com/api/auth/oidc/callback" ||
+		c.OIDCPostLogoutRedirectURL != "https://notes.example.com/login" {
+		t.Errorf("derived URLs wrong: %q %q", c.OIDCRedirectURL, c.OIDCPostLogoutRedirectURL)
+	}
+	if strings.Join(c.OIDCScopes, " ") != "openid email profile" || c.OIDCProviderName != "Single sign-on" {
+		t.Errorf("defaults wrong: %v %q", c.OIDCScopes, c.OIDCProviderName)
+	}
+}
+
+func TestOIDCRedirectFollowsAPIBasePath(t *testing.T) {
+	e := oidcEnv()
+	e["API_BASE_PATH"] = "/v1/api"
+	c, err := Load(env(e), noFiles)
+	if err != nil || c.OIDCRedirectURL != "https://notes.example.com/v1/api/auth/oidc/callback" {
+		t.Fatalf("got %q, %v", c.OIDCRedirectURL, err)
+	}
+}
+
+func TestOIDCClientSecretFile(t *testing.T) {
+	e := oidcEnv()
+	delete(e, "OIDC_CLIENT_SECRET")
+	e["OIDC_CLIENT_SECRET_FILE"] = "/secrets/oidc"
+	read := func(string) ([]byte, error) { return []byte("from-file\n"), nil }
+	c, err := Load(env(e), read)
+	if err != nil || c.OIDCClientSecret != "from-file" {
+		t.Fatalf("got %q, %v", c.OIDCClientSecret, err)
+	}
+}
+
+func TestOIDCValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(e map[string]string)
+		wantErr string // substring; "" means the config must load
+	}{
+		{"valid with all options", func(e map[string]string) {
+			e["OIDC_SCOPES"] = "openid  email"
+			e["OIDC_LOGOUT_URL"] = "https://d.example.com/logout?client_id={client_id}&logout_uri={post_logout_redirect_uri}"
+			e["OIDC_DISCOVERY_URL"] = "https://internal.example.com/realm"
+		}, ""},
+		{"issuer missing", func(e map[string]string) { delete(e, "OIDC_ISSUER_URL") }, "OIDC_ISSUER_URL"},
+		{"issuer http", func(e map[string]string) { e["OIDC_ISSUER_URL"] = "http://idp.example.com" }, "OIDC_ISSUER_URL must use https"},
+		{"issuer relative", func(e map[string]string) { e["OIDC_ISSUER_URL"] = "idp.example.com" }, "OIDC_ISSUER_URL"},
+		{"issuer with fragment", func(e map[string]string) { e["OIDC_ISSUER_URL"] = "https://idp.example.com/#x" }, "OIDC_ISSUER_URL"},
+		{"client id missing", func(e map[string]string) { delete(e, "OIDC_CLIENT_ID") }, "OIDC_CLIENT_ID"},
+		{"client secret missing", func(e map[string]string) { delete(e, "OIDC_CLIENT_SECRET") }, "OIDC_CLIENT_SECRET"},
+		{"public app url missing", func(e map[string]string) { delete(e, "PUBLIC_APP_URL") }, "PUBLIC_APP_URL is required when AUTH_PROVIDER=oidc"},
+		{"public app url http", func(e map[string]string) { e["PUBLIC_APP_URL"] = "http://notes.example.com" }, "OIDC_REDIRECT_URL must use https"},
+		{"redirect http", func(e map[string]string) { e["OIDC_REDIRECT_URL"] = "http://notes.example.com/cb" }, "OIDC_REDIRECT_URL must use https"},
+		{"logout http", func(e map[string]string) { e["OIDC_LOGOUT_URL"] = "http://d.example.com/logout?c={client_id}" }, "OIDC_LOGOUT_URL must use https"},
+		{"post logout http", func(e map[string]string) { e["OIDC_POST_LOGOUT_REDIRECT_URL"] = "http://notes.example.com/login" }, "OIDC_POST_LOGOUT_REDIRECT_URL must use https"},
+		{"discovery http", func(e map[string]string) { e["OIDC_DISCOVERY_URL"] = "http://keycloak:8080/realm" }, "OIDC_DISCOVERY_URL must use https"},
+		{"scopes without openid", func(e map[string]string) { e["OIDC_SCOPES"] = "email profile" }, "OIDC_SCOPES must contain openid"},
+		{"http allowed for local development", func(e map[string]string) {
+			e["SESSION_COOKIE_SECURE"] = "false"
+			e["PUBLIC_APP_URL"] = "http://localhost:3000"
+			e["OIDC_ISSUER_URL"] = "http://localhost:8081/realms/cloud-notes"
+			e["OIDC_DISCOVERY_URL"] = "http://keycloak:8080/realms/cloud-notes"
+		}, ""},
+		{"non-http scheme is never allowed", func(e map[string]string) {
+			e["SESSION_COOKIE_SECURE"] = "false"
+			e["OIDC_ISSUER_URL"] = "ftp://idp.example.com"
+		}, "OIDC_ISSUER_URL must use https"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := oidcEnv()
+			tc.mutate(e)
+			_, err := Load(env(e), noFiles)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestOIDCErrorsAreAggregated(t *testing.T) {
+	_, err := Load(env(map[string]string{
+		"AUTH_PROVIDER": "oidc", "DB_HOST": "db", "DB_NAME": "n", "DB_USER": "u", "DB_PASSWORD": "p",
+	}), noFiles)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	for _, want := range []string{"PUBLIC_APP_URL", "OIDC_ISSUER_URL", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error list missing %s:\n%v", want, err)
+		}
+	}
+}
+
+func TestSharingStillRequiresPublicAppURLWithOIDC(t *testing.T) {
+	e := oidcEnv()
+	delete(e, "PUBLIC_APP_URL")
+	e["FEATURE_PUBLIC_SHARING"] = "true"
+	_, err := Load(env(e), noFiles)
+	if err == nil || !strings.Contains(err.Error(), "FEATURE_PUBLIC_SHARING") || !strings.Contains(err.Error(), "AUTH_PROVIDER=oidc") {
+		t.Errorf("want both PUBLIC_APP_URL reasons, got %v", err)
+	}
+}
+
+func TestIdentityPlatformDefaults(t *testing.T) {
+	c, err := Load(env(idpEnv()), noFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AuthProvider != AuthIdentityPlatform || c.IDPProjectID != "my-project" || c.IDPAPIKey != "public-key" ||
+		c.IDPAuthDomain != "my-project.firebaseapp.com" || c.IDPTenantID != "" {
+		t.Errorf("settings wrong: %+v", c)
+	}
+	if len(c.IDPSignInMethods) != 1 || c.IDPSignInMethods[0] != SignInPassword {
+		t.Errorf("sign-in methods = %v, want [password]", c.IDPSignInMethods)
+	}
+}
+
+func TestIdentityPlatformValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(e map[string]string)
+		wantErr     string
+		wantMethods string
+	}{
+		{"project missing", func(e map[string]string) { delete(e, "IDP_PROJECT_ID") }, "IDP_PROJECT_ID", ""},
+		{"api key missing", func(e map[string]string) { delete(e, "IDP_API_KEY") }, "IDP_API_KEY", ""},
+		{"auth domain missing", func(e map[string]string) { delete(e, "IDP_AUTH_DOMAIN") }, "IDP_AUTH_DOMAIN", ""},
+		{"auth domain with scheme", func(e map[string]string) { e["IDP_AUTH_DOMAIN"] = "https://a.firebaseapp.com" }, "IDP_AUTH_DOMAIN must be a bare host name", ""},
+		{"auth domain with path", func(e map[string]string) { e["IDP_AUTH_DOMAIN"] = "a.firebaseapp.com/x" }, "IDP_AUTH_DOMAIN must be a bare host name", ""},
+		{"auth domain with port", func(e map[string]string) { e["IDP_AUTH_DOMAIN"] = "a.firebaseapp.com:443" }, "IDP_AUTH_DOMAIN must be a bare host name", ""},
+		{"tenant is optional", func(e map[string]string) { e["IDP_TENANT_ID"] = "tenant-abc" }, "", "password"},
+		{"password and google", func(e map[string]string) { e["IDP_SIGN_IN_METHODS"] = "password, Google" }, "", "password,google"},
+		{"duplicates collapse", func(e map[string]string) { e["IDP_SIGN_IN_METHODS"] = "google,google" }, "", "google"},
+		{"unknown method", func(e map[string]string) { e["IDP_SIGN_IN_METHODS"] = "password,facebook" }, "IDP_SIGN_IN_METHODS", ""},
+		{"only separators", func(e map[string]string) { e["IDP_SIGN_IN_METHODS"] = " , " }, "IDP_SIGN_IN_METHODS must list at least one", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := idpEnv()
+			tc.mutate(e)
+			c, err := Load(env(e), noFiles)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := strings.Join(c.IDPSignInMethods, ","); got != tc.wantMethods {
+				t.Errorf("sign-in methods = %q, want %q", got, tc.wantMethods)
+			}
+		})
+	}
+}
+
+// The values docker-compose.oidc.yml gives the backend (Keycloak in the local
+// stack) must pass validation: plain http is only acceptable because the
+// stack runs with SESSION_COOKIE_SECURE=false.
+func TestOIDCLocalKeycloakStackIsValid(t *testing.T) {
+	e := baseEnv()
+	for k, v := range map[string]string{
+		"AUTH_PROVIDER": "oidc", "SESSION_COOKIE_SECURE": "false", "PUBLIC_APP_URL": "http://localhost:3000",
+		"OIDC_ISSUER_URL":    "http://localhost:8081/realms/cloud-notes",
+		"OIDC_DISCOVERY_URL": "http://keycloak:8080/realms/cloud-notes",
+		"OIDC_CLIENT_ID":     "cloud-notes", "OIDC_CLIENT_SECRET": "cloud-notes-local-only-secret",
+		"OIDC_PROVIDER_NAME": "Keycloak",
+	} {
+		e[k] = v
+	}
+	c, err := Load(env(e), noFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.OIDCRedirectURL != "http://localhost:3000/api/auth/oidc/callback" || c.OIDCPostLogoutRedirectURL != "http://localhost:3000/login" {
+		t.Errorf("redirect URLs must match the Keycloak realm: %q %q", c.OIDCRedirectURL, c.OIDCPostLogoutRedirectURL)
+	}
+}
