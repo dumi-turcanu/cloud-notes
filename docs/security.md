@@ -123,6 +123,11 @@ These are deliberate scope decisions; the application does not provide the follo
   copies already made.
 - The local Docker Compose stack uses plain HTTP, open sign-up and a throw-away database
   password. It is not a model for deployment.
+- **Images and tools are pinned by version tag, not by digest.** The base images in
+  `backend/Dockerfile` and `frontend/Dockerfile` and the lint and scan tools in the Makefiles use
+  version tags, so a rebuild picks up patched images, but a tag can be re-pointed upstream. For a
+  production pipeline, pin by digest and let Renovate or Dependabot keep the digests current (see the
+  hardening checklist below). Engineers are welcome to tighten this.
 
 ## Hardening checklist
 
