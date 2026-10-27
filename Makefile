@@ -5,8 +5,8 @@ SHA        ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BASE_URL   ?= http://localhost:3000
 
-HADOLINT   := hadolint/hadolint:latest-alpine
-SHELLCHECK := koalaman/shellcheck:stable
+HADOLINT   := hadolint/hadolint:v2.15.1-alpine
+SHELLCHECK := koalaman/shellcheck:v0.11.0
 SHELL_SRC  := scripts/smoke-test.sh scripts/smoke-test-oidc.sh $(wildcard frontend/nginx/docker-entrypoint.d/*.sh)
 COMPOSE_OIDC := docker compose -f docker-compose.yml -f docker-compose.oidc.yml
 
